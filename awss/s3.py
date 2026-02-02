@@ -28,12 +28,16 @@ class ObjectInfo:
 
 
 class S3Service:
-    def __init__(self, profiles: Optional[list[str]] = None, region: Optional[str] = None) -> None:
+    def __init__(
+        self, profiles: Optional[list[str]] = None, region: Optional[str] = None
+    ) -> None:
         self.profiles = self._normalize_profiles(profiles)
         self._region = region
         self._clients: dict[str, object] = {}
 
-    def _normalize_profiles(self, profiles: Optional[Iterable[str]]) -> list[Optional[str]]:
+    def _normalize_profiles(
+        self, profiles: Optional[Iterable[str]]
+    ) -> list[Optional[str]]:
         if profiles:
             raw_profiles = list(profiles)
         else:
@@ -95,7 +99,9 @@ class S3Service:
             targets.append(profile_name)
         return targets
 
-    async def select_best_bucket_profiles(self, buckets: list[BucketInfo]) -> list[BucketInfo]:
+    async def select_best_bucket_profiles(
+        self, buckets: list[BucketInfo]
+    ) -> list[BucketInfo]:
         by_name: dict[str, list[Optional[str]]] = {}
         for bucket in buckets:
             by_name.setdefault(bucket.name, []).append(bucket.profile)
@@ -221,8 +227,12 @@ class S3Service:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
 
-    async def list_buckets_all(self) -> tuple[list[BucketInfo], list[tuple[Optional[str], Exception]]]:
-        tasks = [asyncio.to_thread(self._list_buckets, profile) for profile in self.profiles]
+    async def list_buckets_all(
+        self,
+    ) -> tuple[list[BucketInfo], list[tuple[Optional[str], Exception]]]:
+        tasks = [
+            asyncio.to_thread(self._list_buckets, profile) for profile in self.profiles
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         buckets: list[BucketInfo] = []
         errors: list[tuple[Optional[str], Exception]] = []
@@ -239,10 +249,14 @@ class S3Service:
         response = client.list_buckets()
         return [bucket["Name"] for bucket in response.get("Buckets", [])]
 
-    async def list_prefixes(self, profile: Optional[str], bucket: str, prefix: str) -> list[str]:
+    async def list_prefixes(
+        self, profile: Optional[str], bucket: str, prefix: str
+    ) -> list[str]:
         return await asyncio.to_thread(self._list_prefixes, profile, bucket, prefix)
 
-    def _list_prefixes(self, profile: Optional[str], bucket: str, prefix: str) -> list[str]:
+    def _list_prefixes(
+        self, profile: Optional[str], bucket: str, prefix: str
+    ) -> list[str]:
         client = self._client(profile)
         prefixes: list[str] = []
         continuation: Optional[str] = None
@@ -433,7 +447,9 @@ class S3Service:
                 total_size += size
                 scanned += 1
                 last_modified = entry.get("LastModified")
-                if last_modified and (latest_modified is None or last_modified > latest_modified):
+                if last_modified and (
+                    latest_modified is None or last_modified > latest_modified
+                ):
                     latest_modified = last_modified
                 relative = (
                     key[len(base_prefix) :]

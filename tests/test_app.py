@@ -47,8 +47,12 @@ class TestAppHelpers(unittest.TestCase):
         app = S3Browser(profiles=["default"])
         self.assertEqual(app._parse_s3_path("s3://my-bucket"), ("my-bucket", ""))
         self.assertEqual(app._parse_s3_path("s3://my-bucket/"), ("my-bucket", ""))
-        self.assertEqual(app._parse_s3_path("s3://my-bucket/a/b/"), ("my-bucket", "a/b/"))
-        self.assertEqual(app._parse_s3_path("s3://my-bucket/a/b.txt"), ("my-bucket", "a/"))
+        self.assertEqual(
+            app._parse_s3_path("s3://my-bucket/a/b/"), ("my-bucket", "a/b/")
+        )
+        self.assertEqual(
+            app._parse_s3_path("s3://my-bucket/a/b.txt"), ("my-bucket", "a/")
+        )
         self.assertEqual(app._parse_s3_path("my-bucket/a/b.txt"), ("my-bucket", "a/"))
 
     def test_profile_for_bucket(self) -> None:
@@ -64,7 +68,9 @@ class TestAppHelpers(unittest.TestCase):
         app = S3Browser(profiles=["default"])
         app._canonical_path = "s3://"
         self.assertEqual(app._resolve_input_path("bucket"), "s3://bucket")
-        self.assertEqual(app._resolve_input_path("s3://bucket/prefix/"), "s3://bucket/prefix/")
+        self.assertEqual(
+            app._resolve_input_path("s3://bucket/prefix/"), "s3://bucket/prefix/"
+        )
         app._canonical_path = "s3://bucket/prefix/"
         self.assertEqual(app._resolve_input_path("child/"), "s3://child/")
         self.assertEqual(app._resolve_input_path("/child/"), "s3://child/")

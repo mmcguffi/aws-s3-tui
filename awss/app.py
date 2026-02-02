@@ -7,15 +7,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual import events
-from textual.screen import ModalScreen
-from textual.widget import Widget
-from textual.widgets import Button, DataTable, Footer, Header, Input, Static, TextArea, Tree
 from rich.align import Align
 from rich.style import Style
 from rich.text import Text
+from textual import events
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widget import Widget
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Static,
+    TextArea,
+    Tree,
+)
 
 from .s3 import BucketInfo, ObjectInfo, S3Service
 
@@ -57,7 +66,9 @@ class DeepStats:
 
 
 class SplitHandle(Widget):
-    def __init__(self, orientation: str, before_id: str, after_id: str, **kwargs) -> None:
+    def __init__(
+        self, orientation: str, before_id: str, after_id: str, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self.orientation = orientation
         self.before_id = before_id
@@ -90,7 +101,11 @@ class SplitHandle(Widget):
     def on_mouse_move(self, event: events.MouseMove) -> None:
         if not self._dragging:
             return
-        delta = event.screen_x - self._start_pos if self.orientation == "vertical" else event.screen_y - self._start_pos
+        delta = (
+            event.screen_x - self._start_pos
+            if self.orientation == "vertical"
+            else event.screen_y - self._start_pos
+        )
         before, after = self._targets()
         if self.orientation == "vertical":
             min_before = 20
@@ -99,7 +114,9 @@ class SplitHandle(Widget):
             if total < min_before + min_after:
                 min_before = max(1, total // 2)
                 min_after = max(1, total - min_before)
-            new_before = max(min_before, min(total - min_after, self._start_before + delta))
+            new_before = max(
+                min_before, min(total - min_after, self._start_before + delta)
+            )
             new_after = total - new_before
             before.styles.width = new_before
             after.styles.width = new_after
@@ -110,7 +127,9 @@ class SplitHandle(Widget):
             if total < min_before + min_after:
                 min_before = max(1, total // 2)
                 min_after = max(1, total - min_before)
-            new_before = max(min_before, min(total - min_after, self._start_before + delta))
+            new_before = max(
+                min_before, min(total - min_after, self._start_before + delta)
+            )
             new_after = total - new_before
             before.styles.height = new_before
             after.styles.height = new_after
@@ -223,7 +242,10 @@ class DownloadDialog(ModalScreen[Optional[str]]):
     """
 
     def __init__(
-        self, default_path: str, label: str = "Download to:", info_lines: Optional[list[str]] = None
+        self,
+        default_path: str,
+        label: str = "Download to:",
+        info_lines: Optional[list[str]] = None,
     ) -> None:
         super().__init__()
         self._default_path = default_path
@@ -534,7 +556,9 @@ class S3Browser(App):
         ("m", "preview_more", "More/Scan"),
     ]
 
-    def __init__(self, profiles: Optional[list[str]] = None, region: Optional[str] = None) -> None:
+    def __init__(
+        self, profiles: Optional[list[str]] = None, region: Optional[str] = None
+    ) -> None:
         super().__init__()
         self.service = S3Service(profiles=profiles, region=region)
         self.buckets: list[BucketInfo] = []
@@ -587,10 +611,20 @@ class S3Browser(App):
             yield Button("↓", id="download", compact=True)
         with Horizontal(id="body"):
             yield Tree("", id="s3-tree")
-            yield SplitHandle("vertical", before_id="s3-tree", after_id="right-pane", classes="split-vertical")
+            yield SplitHandle(
+                "vertical",
+                before_id="s3-tree",
+                after_id="right-pane",
+                classes="split-vertical",
+            )
             with Vertical(id="right-pane"):
                 yield PreviewTable(id="s3-table")
-                yield SplitHandle("horizontal", before_id="s3-table", after_id="preview", classes="split-horizontal")
+                yield SplitHandle(
+                    "horizontal",
+                    before_id="s3-table",
+                    after_id="preview",
+                    classes="split-horizontal",
+                )
                 with Vertical(id="preview"):
                     yield Static("", id="preview-header")
                     yield TextArea(
@@ -662,7 +696,9 @@ class S3Browser(App):
                 stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
-            self.notify("AWS CLI not found; cannot run `aws sso login`.", severity="error")
+            self.notify(
+                "AWS CLI not found; cannot run `aws sso login`.", severity="error"
+            )
             return
         stdout, stderr = await process.communicate()
         if process.returncode == 0:
@@ -694,7 +730,9 @@ class S3Browser(App):
         )
         modified_base = max(
             16,
-            table.columns[self._col_modified].content_width if self._col_modified else 16,
+            table.columns[self._col_modified].content_width
+            if self._col_modified
+            else 16,
         )
         name_base = max(
             8,
@@ -705,7 +743,9 @@ class S3Browser(App):
             return
         content_total = icon_width + size_base + modified_base + name_base
         if content_total >= available_content:
-            name_width = max(1, available_content - (icon_width + size_base + modified_base))
+            name_width = max(
+                1, available_content - (icon_width + size_base + modified_base)
+            )
             size_width = size_base
             modified_width = modified_base
         else:
@@ -774,7 +814,9 @@ class S3Browser(App):
             default_dir = str(Path.home() / "Downloads")
             info_lines = self._download_info_lines(selected)
             target = await self.push_screen_wait(
-                DownloadDialog(default_dir, label="Download directory:", info_lines=info_lines)
+                DownloadDialog(
+                    default_dir, label="Download directory:", info_lines=info_lines
+                )
             )
             if not target:
                 return
@@ -795,7 +837,9 @@ class S3Browser(App):
         info = selected[0]
         default_name = str(Path.home() / (Path(info.key).name or "download"))
         info_lines = self._download_info_lines([info])
-        target = await self.push_screen_wait(DownloadDialog(default_name, info_lines=info_lines))
+        target = await self.push_screen_wait(
+            DownloadDialog(default_name, info_lines=info_lines)
+        )
         if not target:
             return
         destination = self._resolve_download_path(target, info)
@@ -810,7 +854,11 @@ class S3Browser(App):
         self.notify(f"Downloaded to {destination}", severity="information")
 
     async def action_preview_more(self) -> None:
-        if self._preview_stats_info and self._preview_stats_shallow and self._preview_stats_deep is None:
+        if (
+            self._preview_stats_info
+            and self._preview_stats_shallow
+            and self._preview_stats_deep is None
+        ):
             if self.preview_more.disabled:
                 return
             await self._load_deep_prefix_stats()
@@ -861,7 +909,9 @@ class S3Browser(App):
             self.s3_tree.select_node(self.s3_tree.root)
             return
         parent_prefix = self._parent_prefix(self.current_context.prefix)
-        self.navigate_to(self.current_context.profile, self.current_context.bucket, parent_prefix)
+        self.navigate_to(
+            self.current_context.profile, self.current_context.bucket, parent_prefix
+        )
 
     async def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
         node = event.node
@@ -915,7 +965,9 @@ class S3Browser(App):
             return
         info: NodeInfo = node.data
         try:
-            prefixes = await self.service.list_prefixes(info.profile, info.bucket, info.prefix)
+            prefixes = await self.service.list_prefixes(
+                info.profile, info.bucket, info.prefix
+            )
         except Exception as exc:
             node.allow_expand = False
             self.notify(f"{exc}", severity="error")
@@ -992,7 +1044,9 @@ class S3Browser(App):
                 self.notify(f"{exc}", severity="error")
                 return
             self._clear_table()
-            self._content_rows = [("Access denied or unavailable", "", "", RowInfo(kind="error"))]
+            self._content_rows = [
+                ("Access denied or unavailable", "", "", RowInfo(kind="error"))
+            ]
             self._active_filter = ""
             self._add_row("Access denied or unavailable", "", "", RowInfo(kind="error"))
             self.notify(f"{exc}", severity="error")
@@ -1026,7 +1080,12 @@ class S3Browser(App):
                     name,
                     "",
                     "",
-                    RowInfo(kind="prefix", profile=info.profile, bucket=info.bucket, prefix=prefix),
+                    RowInfo(
+                        kind="prefix",
+                        profile=info.profile,
+                        bucket=info.bucket,
+                        prefix=prefix,
+                    ),
                 )
             )
         for obj in objects_sorted:
@@ -1258,7 +1317,9 @@ class S3Browser(App):
 
     def navigate_to(self, profile: Optional[str], bucket: str, prefix: str) -> None:
         prev_node = self.s3_tree.cursor_node
-        node, created = self.ensure_tree_path(profile, bucket, prefix, track_created=True)
+        node, created = self.ensure_tree_path(
+            profile, bucket, prefix, track_created=True
+        )
         self._pending_created = created
         self._pending_prev_node = prev_node
         self._pending_target_node = node
@@ -1270,7 +1331,11 @@ class S3Browser(App):
         self.s3_tree.scroll_to_node(node)
 
     def ensure_tree_path(
-        self, profile: Optional[str], bucket: str, prefix: str, track_created: bool = False
+        self,
+        profile: Optional[str],
+        bucket: str,
+        prefix: str,
+        track_created: bool = False,
     ):
         created: list[tuple[object, str, tuple]] = []
         bucket_node = self.bucket_nodes.get((profile, bucket))
@@ -1492,7 +1557,7 @@ class S3Browser(App):
                 continue
             key = self._object_key(info)
             if key and key in self._selected_objects:
-                    selected.append(info)
+                selected.append(info)
         return selected
 
     def _download_info_lines(self, selected: list[RowInfo]) -> list[str]:
@@ -1550,7 +1615,9 @@ class S3Browser(App):
             self._set_preview_button("More", visible=False)
             self._showing_selection_summary = False
 
-    def handle_table_selection_click(self, row_index: int, shift: bool, toggle: bool) -> None:
+    def handle_table_selection_click(
+        self, row_index: int, shift: bool, toggle: bool
+    ) -> None:
         if row_index < 0 or row_index >= len(self._row_keys):
             return
         row_key = self._row_keys[row_index]
@@ -1601,7 +1668,9 @@ class S3Browser(App):
             return
         bucket, prefix = self._parse_s3_path(target)
         if not bucket:
-            self.notify("Path must include a bucket (s3://bucket/prefix/)", severity="warning")
+            self.notify(
+                "Path must include a bucket (s3://bucket/prefix/)", severity="warning"
+            )
             return
         profile = self._profile_for_bucket(bucket)
         self.navigate_to(profile, bucket, prefix)
@@ -1743,7 +1812,9 @@ class S3Browser(App):
         if self._sort_column == "modified":
             dirs_sorted = sorted(dirs, key=name_key, reverse=self._sort_reverse)
 
-            def modified_key(row: tuple[str, str, str, RowInfo]) -> tuple[datetime, str]:
+            def modified_key(
+                row: tuple[str, str, str, RowInfo],
+            ) -> tuple[datetime, str]:
                 info = row[3]
                 return (info.last_modified or datetime.min, name_key(row))
 
@@ -1783,7 +1854,9 @@ class S3Browser(App):
     def _set_preview_header(self, text: str) -> None:
         self.preview_header.update(text)
 
-    def _set_preview_button(self, label: str, visible: bool, disabled: bool = False) -> None:
+    def _set_preview_button(
+        self, label: str, visible: bool, disabled: bool = False
+    ) -> None:
         self.preview_more.label = label
         self.preview_more.disabled = disabled
         if visible:
@@ -1843,9 +1916,7 @@ class S3Browser(App):
                     f"(scanned {deep.scanned} objects)"
                 )
                 subdirs_line = f"Total subdirs (recursive): >= {deep.subdirs} (partial)"
-                size_line = (
-                    f"Total size (recursive): >= {format_size(deep.total_size)} (partial)"
-                )
+                size_line = f"Total size (recursive): >= {format_size(deep.total_size)} (partial)"
             lines.extend([files_line, subdirs_line, size_line])
             lines.append("Scope: immediate children + recursive totals")
             self._set_preview_button("Scan", visible=False)
