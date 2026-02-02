@@ -1,0 +1,102 @@
+name: Bump minor version on PRs
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: write
+
+jobs:
+  bump-minor:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Check for skip marker
+        id: skip
+        run: |
+          msg="$(git log -1 --pretty=%B)"
+          if echo "$msg" | grep -qiE '\[skip version\]|^chore: bump version'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump minor version
+        id: bump
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import pathlib
+          import subprocess
+
+          base_ref = os.environ["BASE_REF"]
+          subprocess.run(["git", "fetch", "origin", base_ref], check=True)
+          base_data = subprocess.check_output(
+              ["git", "show", f"origin/{base_ref}:pyproject.toml"],
+              text=True,
+          )
+
+          def parse_version(data: str) -> tuple[int, int]:
+              match = re.search(r'^(version\s*=\s*")(?P<major>\d+)\.(?P<minor>\d+)(")$', data, re.M)
+              if not match:
+                  raise SystemExit("version not found in pyproject.toml")
+              return int(match.group("major")), int(match.group("minor"))
+
+          base_major, base_minor = parse_version(base_data)
+          target_version = f"{base_major}.{base_minor + 1}"
+
+          path = pathlib.Path("pyproject.toml")
+          current_data = path.read_text()
+          cur_major, cur_minor = parse_version(current_data)
+          current_version = f"{cur_major}.{cur_minor}"
+
+          if current_version == target_version:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write(f"version={current_version}\n")
+              print(f"already at {current_version}")
+              raise SystemExit(0)
+
+          new_data, count = re.subn(
+              r'^(version\s*=\s*")\d+\.\d+(\")$',
+              lambda m: f"{m.group(1)}{target_version}{m.group(2)}",
+              current_data,
+              count=1,
+              flags=re.M,
+          )
+          if count != 1:
+              raise SystemExit("version replace failed")
+
+          path.write_text(new_data)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={target_version}\n")
+
+          print(f"bumped to {target_version}")
+          PY
+
+      - name: Commit and push
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.version }} [skip version]"
+          git push origin HEAD:${{ github.head_ref }}
