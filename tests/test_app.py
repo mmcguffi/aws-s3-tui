@@ -1,0 +1,87 @@
+import argparse
+import unittest
+
+from awss.app import (
+    NodeInfo,
+    RowInfo,
+    S3Browser,
+    _parse_profiles,
+    display_segment,
+    format_size,
+    format_time,
+)
+
+
+class TestAppHelpers(unittest.TestCase):
+    def test_format_size(self) -> None:
+        self.assertEqual(format_size(0), "0 B")
+        self.assertEqual(format_size(512), "512 B")
+        self.assertEqual(format_size(1024), "1.0 KB")
+        self.assertEqual(format_size(1536), "1.5 KB")
+
+    def test_format_time(self) -> None:
+        self.assertEqual(format_time(None), "")
+
+    def test_display_segment(self) -> None:
+        self.assertEqual(display_segment("foo/bar/", "foo/"), "bar")
+        self.assertEqual(display_segment("foo/", ""), "foo")
+        self.assertEqual(display_segment("foo/bar/baz", "foo/bar/"), "baz")
+
+    def test_parse_profiles(self) -> None:
+        args = argparse.Namespace(profiles="dev, prod", profile=None)
+        self.assertEqual(_parse_profiles(args), ["dev", "prod"])
+
+        args = argparse.Namespace(profiles=None, profile=["stage", "prod"])
+        self.assertEqual(_parse_profiles(args), ["stage", "prod"])
+
+        args = argparse.Namespace(profiles=None, profile=None)
+        self.assertIsNone(_parse_profiles(args))
+
+    def test_parent_prefix(self) -> None:
+        app = S3Browser(profiles=["default"])
+        self.assertEqual(app._parent_prefix("foo/bar/"), "foo/")
+        self.assertEqual(app._parent_prefix("foo/"), "")
+        self.assertEqual(app._parent_prefix(""), "")
+
+    def test_parse_s3_path(self) -> None:
+        app = S3Browser(profiles=["default"])
+        self.assertEqual(app._parse_s3_path("s3://my-bucket"), ("my-bucket", ""))
+        self.assertEqual(app._parse_s3_path("s3://my-bucket/"), ("my-bucket", ""))
+        self.assertEqual(app._parse_s3_path("s3://my-bucket/a/b/"), ("my-bucket", "a/b/"))
+        self.assertEqual(app._parse_s3_path("s3://my-bucket/a/b.txt"), ("my-bucket", "a/"))
+        self.assertEqual(app._parse_s3_path("my-bucket/a/b.txt"), ("my-bucket", "a/"))
+
+    def test_profile_for_bucket(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.buckets = []
+        self.assertIsNone(app._profile_for_bucket("missing"))
+        app.buckets = []
+        app.bucket_nodes[("dev", "bucket-a")] = object()
+        self.assertIsNone(app._profile_for_bucket("missing"))
+        self.assertEqual(app._profile_for_bucket("bucket-a"), "dev")
+
+    def test_resolve_input_path(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app._canonical_path = "s3://"
+        self.assertEqual(app._resolve_input_path("bucket"), "s3://bucket")
+        self.assertEqual(app._resolve_input_path("s3://bucket/prefix/"), "s3://bucket/prefix/")
+        app._canonical_path = "s3://bucket/prefix/"
+        self.assertEqual(app._resolve_input_path("child/"), "s3://child/")
+        self.assertEqual(app._resolve_input_path("/child/"), "s3://child/")
+
+    def test_derive_filter(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app._content_rows = [
+            ("alpha", "BUCKET", "", "", RowInfo(kind="bucket", bucket="alpha")),
+            ("beta", "BUCKET", "", "", RowInfo(kind="bucket", bucket="beta")),
+        ]
+        app._canonical_path = "s3://"
+        self.assertEqual(app._derive_filter("s3://a"), "a")
+        app.current_context = NodeInfo(profile=None, bucket="my-bucket", prefix="a/b/")
+        app._canonical_path = "s3://my-bucket/a/b/"
+        self.assertEqual(app._derive_filter("s3://my-bucket/a/b/fo"), "fo")
+        self.assertEqual(app._derive_filter("my-bucket/a/b/fo"), "fo")
+
+
+if __name__ == "__main__":
+    unittest.main()
