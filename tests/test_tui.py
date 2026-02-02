@@ -4,6 +4,12 @@ from awss.app import S3Browser
 
 
 class _StubService:
+    def sso_login_targets(self) -> list[str]:
+        return []
+
+    async def select_best_bucket_profiles(self, buckets):
+        return buckets
+
     async def list_buckets_all(self):
         return [], []
 

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Iterable, Optional
 
 import boto3
+import botocore.session
+from botocore.exceptions import ConfigNotFound
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,9 @@ class S3Service:
     def _profile_key(self, profile: Optional[str]) -> str:
         return profile or "__default__"
 
+    def _profile_label(self, profile: Optional[str]) -> str:
+        return profile or "default"
+
     def _client(self, profile: Optional[str]):
         key = self._profile_key(profile)
         if key in self._clients:
@@ -64,6 +71,155 @@ class S3Service:
             client = session.client("s3")
         self._clients[key] = client
         return client
+
+    def sso_login_targets(self) -> list[str]:
+        start_urls = self._load_sso_profile_start_urls()
+        if not start_urls:
+            return []
+        expirations = self._load_sso_token_expirations()
+        now = datetime.now(timezone.utc)
+        buffer = timedelta(minutes=5)
+        targets: list[str] = []
+        seen: set[str] = set()
+        for profile in self.profiles:
+            profile_name = self._profile_label(profile)
+            start_url = start_urls.get(profile_name)
+            if not start_url:
+                continue
+            expires_at = expirations.get(start_url)
+            if expires_at and expires_at > now + buffer:
+                continue
+            if start_url in seen:
+                continue
+            seen.add(start_url)
+            targets.append(profile_name)
+        return targets
+
+    async def select_best_bucket_profiles(self, buckets: list[BucketInfo]) -> list[BucketInfo]:
+        by_name: dict[str, list[Optional[str]]] = {}
+        for bucket in buckets:
+            by_name.setdefault(bucket.name, []).append(bucket.profile)
+        if all(len(profiles) == 1 for profiles in by_name.values()):
+            return buckets
+
+        tasks: list[asyncio.Future] = []
+        task_keys: list[tuple[str, Optional[str]]] = []
+        for name, profiles in by_name.items():
+            if len(profiles) < 2:
+                continue
+            for profile in profiles:
+                task_keys.append((name, profile))
+                tasks.append(
+                    asyncio.to_thread(self._score_profile_for_bucket, name, profile)
+                )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        scores: dict[tuple[str, Optional[str]], int] = {}
+        for key, result in zip(task_keys, results):
+            if isinstance(result, Exception):
+                scores[key] = 0
+            else:
+                scores[key] = int(result)
+
+        profile_rank = {profile: index for index, profile in enumerate(self.profiles)}
+        resolved: list[BucketInfo] = []
+        for name, profiles in by_name.items():
+            if len(profiles) == 1:
+                resolved.append(BucketInfo(name=name, profile=profiles[0]))
+                continue
+
+            def profile_key(profile: Optional[str]) -> tuple[int, int]:
+                score = scores.get((name, profile), 0)
+                rank = profile_rank.get(profile, len(profile_rank))
+                return (score, -rank)
+
+            best_profile = max(profiles, key=profile_key)
+            resolved.append(BucketInfo(name=name, profile=best_profile))
+        return resolved
+
+    def _score_profile_for_bucket(self, bucket: str, profile: Optional[str]) -> int:
+        client = self._client(profile)
+        try:
+            response = client.list_objects_v2(Bucket=bucket, MaxKeys=1)
+        except Exception:
+            return 0
+        score = 2
+        contents = response.get("Contents", [])
+        if contents:
+            key = contents[0].get("Key")
+            if key:
+                try:
+                    client.head_object(Bucket=bucket, Key=key)
+                    score += 1
+                except Exception:
+                    pass
+        return score
+
+    def _load_full_config(self) -> dict:
+        session = botocore.session.get_session()
+        try:
+            return session.full_config
+        except ConfigNotFound:
+            return {}
+        except Exception:
+            return {}
+
+    def _load_sso_profile_start_urls(self) -> dict[str, str]:
+        full_config = self._load_full_config()
+        profiles = full_config.get("profiles", {})
+        sso_sessions = full_config.get("sso_sessions", {})
+        start_urls: dict[str, str] = {}
+        for profile_name, profile_config in profiles.items():
+            if not isinstance(profile_config, dict):
+                continue
+            start_url = profile_config.get("sso_start_url")
+            session_name = profile_config.get("sso_session")
+            if not start_url and session_name:
+                session_config = sso_sessions.get(session_name, {})
+                if isinstance(session_config, dict):
+                    start_url = session_config.get("sso_start_url")
+            if start_url:
+                start_urls[profile_name] = start_url
+        return start_urls
+
+    def _load_sso_token_expirations(self) -> dict[str, datetime]:
+        cache_dir = Path.home() / ".aws" / "sso" / "cache"
+        if not cache_dir.exists():
+            return {}
+        expirations: dict[str, datetime] = {}
+        for path in cache_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            start_url = data.get("startUrl") or data.get("start_url")
+            expires_at_raw = data.get("expiresAt") or data.get("expires_at")
+            if not start_url or not expires_at_raw:
+                continue
+            expires_at = self._parse_sso_expires_at(expires_at_raw)
+            if not expires_at:
+                continue
+            current = expirations.get(start_url)
+            if current is None or expires_at > current:
+                expirations[start_url] = expires_at
+        return expirations
+
+    def _parse_sso_expires_at(self, value: str) -> Optional[datetime]:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if text.endswith("UTC"):
+            text = f"{text[:-3]}+00:00"
+        elif text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
     async def list_buckets_all(self) -> tuple[list[BucketInfo], list[tuple[Optional[str], Exception]]]:
         tasks = [asyncio.to_thread(self._list_buckets, profile) for profile in self.profiles]

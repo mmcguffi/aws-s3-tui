@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -631,7 +632,47 @@ class S3Browser(App):
         self.set_focus(self.s3_tree)
         self._sync_nav_buttons()
         self._resize_table_columns()
+        await self._ensure_sso_logins()
         await self.refresh_buckets()
+
+    async def _ensure_sso_logins(self) -> None:
+        if not hasattr(self.service, "sso_login_targets"):
+            return
+        try:
+            targets = self.service.sso_login_targets()
+        except Exception as exc:
+            self.notify(f"SSO preflight failed: {exc}", severity="warning")
+            return
+        for profile in targets:
+            self.notify(
+                f"SSO login required for profile '{profile}'. Opening browser...",
+                severity="warning",
+            )
+            await self._run_sso_login(profile)
+
+    async def _run_sso_login(self, profile: str) -> None:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "aws",
+                "sso",
+                "login",
+                "--profile",
+                profile,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            self.notify("AWS CLI not found; cannot run `aws sso login`.", severity="error")
+            return
+        stdout, stderr = await process.communicate()
+        if process.returncode == 0:
+            return
+        message = stderr.decode("utf-8", errors="replace").strip()
+        if not message:
+            message = stdout.decode("utf-8", errors="replace").strip()
+        if not message:
+            message = f"aws sso login failed for profile '{profile}'."
+        self.notify(message, severity="error")
 
     def on_resize(self, event: events.Resize) -> None:
         self._resize_table_columns()
@@ -689,6 +730,12 @@ class S3Browser(App):
         apply_width(self._col_name, name_width)
         table._require_update_dimensions = True
         table.refresh(layout=True)
+
+    def _bucket_label(self, bucket: BucketInfo) -> Text:
+        profile_label = bucket.profile or "default"
+        label = Text(bucket.name, style="bold cyan")
+        label.append(f" [{profile_label}]", style="dim")
+        return label
 
     async def action_refresh(self) -> None:
         await self.refresh_buckets()
@@ -899,13 +946,14 @@ class S3Browser(App):
         buckets, errors = await self.service.list_buckets_all()
         if token != self._load_token:
             return
+        buckets = await self.service.select_best_bucket_profiles(buckets)
         self.path_input.placeholder = "bucket/prefix/"
         self.buckets = sorted(buckets, key=lambda b: b.name.lower())
         if errors:
             self.notify("Some credentials could not list buckets.", severity="warning")
         for bucket in self.buckets:
             node = self.s3_tree.root.add(
-                Text(bucket.name, style="bold cyan"),
+                self._bucket_label(bucket),
                 data=NodeInfo(profile=bucket.profile, bucket=bucket.name, prefix=""),
                 allow_expand=True,
             )
