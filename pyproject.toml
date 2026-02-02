@@ -1,6 +1,6 @@
 [project]
 name = "awss3tui"
-version = "0.1"
+version = "0.2"
 description = "Textual TUI to navigate S3 across multiple AWS profiles"
 readme = "README.md"
 requires-python = ">=3.10"
