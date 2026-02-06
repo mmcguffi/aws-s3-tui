@@ -153,6 +153,17 @@ class SplitHandle(Widget):
         return "─"
 
 
+class S3Tree(Tree):
+    def on_key(self, event: events.Key) -> None:
+        if event.key != "right":
+            return
+        app = self.app
+        if not hasattr(app, "s3_table"):
+            return
+        app.set_focus(app.s3_table)
+        event.stop()
+
+
 class PreviewTable(DataTable):
     def _get_row_style(self, row_index: int, base_style: Style) -> Style:
         row_style = super()._get_row_style(row_index, base_style)
@@ -190,6 +201,12 @@ class PreviewTable(DataTable):
             if event.shift or event.meta or event.ctrl:
                 return
             await self.app.preview_selected_row()
+
+    def action_cursor_left(self) -> None:
+        if hasattr(self.app, "s3_tree"):
+            self.app.set_focus(self.app.s3_tree)
+            return
+        super().action_cursor_left()
 
     def action_select_cursor(self) -> None:
         self.app.action_download()
@@ -610,7 +627,7 @@ class S3Browser(App):
             yield Button("→", id="nav-forward", compact=True)
             yield Button("↓", id="download", compact=True)
         with Horizontal(id="body"):
-            yield Tree("", id="s3-tree")
+            yield S3Tree("", id="s3-tree")
             yield SplitHandle(
                 "vertical",
                 before_id="s3-tree",
