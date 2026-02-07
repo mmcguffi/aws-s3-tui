@@ -1,4 +1,6 @@
+import asyncio
 import unittest
+from unittest.mock import patch
 
 from awss.app import S3Browser
 
@@ -32,6 +34,27 @@ class TestTuiMount(unittest.IsolatedAsyncioTestCase):
         app.service = _StubService()
         async with app.run_test() as pilot:
             await pilot.pause()
+
+    async def test_double_escape_quits(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.service = _StubService()
+        with patch.object(app, "exit") as exit_mock:
+            async with app.run_test() as pilot:
+                await pilot.press("escape")
+                exit_mock.assert_not_called()
+                await pilot.press("escape")
+                exit_mock.assert_called_once()
+
+    async def test_escape_quit_window_expires(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.service = _StubService()
+        app._quit_escape_deadline = 0.0
+        with patch.object(app, "exit") as exit_mock:
+            async with app.run_test() as pilot:
+                await pilot.press("escape")
+                await asyncio.sleep(1.1)
+                await pilot.press("escape")
+                exit_mock.assert_not_called()
 
 
 if __name__ == "__main__":

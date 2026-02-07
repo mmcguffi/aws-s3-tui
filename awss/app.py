@@ -4,16 +4,19 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from time import monotonic
 from typing import Optional
 
-from rich.align import Align
 from rich.style import Style
+from rich.measure import Measurement
+from rich.segment import Segment
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.widget import Widget
 from textual.widgets import (
     Button,
@@ -181,6 +184,33 @@ class PreviewTable(DataTable):
             return row_style + selected_style
         return row_style
 
+    def _render_cell(
+        self,
+        row_index: int,
+        column_index: int,
+        base_style: Style,
+        width: int,
+        cursor: bool = False,
+        hover: bool = False,
+    ):
+        lines = super()._render_cell(
+            row_index,
+            column_index,
+            base_style,
+            width,
+            cursor=cursor,
+            hover=hover,
+        )
+        padded: list[list[Segment]] = []
+        for line in lines:
+            if not line:
+                padded.append([Segment(" " * width, base_style)])
+                continue
+            style = line[-1].style or base_style
+            strip = Strip(line).adjust_cell_length(width, style)
+            padded.append(list(strip))
+        return padded
+
     async def on_click(self, event: events.Click) -> None:
         if event.button != 1:
             return
@@ -209,10 +239,17 @@ class PreviewTable(DataTable):
         super().action_cursor_left()
 
     def action_select_cursor(self) -> None:
+        info = self.app._row_info_for_cursor()
+        if info and info.kind in {"bucket", "prefix", "parent"}:
+            self.app.run_worker(self.app.open_selected_row())
+            return
         self.app.action_download()
 
 
 class DownloadDialog(ModalScreen[Optional[str]]):
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
     CSS = """
     DownloadDialog {
         align: center middle;
@@ -236,7 +273,27 @@ class DownloadDialog(ModalScreen[Optional[str]]):
         content-align: center middle;
         align: center middle;
         margin-top: 1;
-        height: 1;
+        height: auto;
+    }
+
+    .download-action {
+        width: auto;
+        height: auto;
+        align: center middle;
+        content-align: center middle;
+    }
+
+    .download-action-right {
+        margin-left: 2;
+    }
+
+    .download-hint {
+        width: 100%;
+        content-align: center middle;
+        text-align: center;
+        color: $text-muted;
+        text-style: dim;
+        text-opacity: 60%;
     }
 
     #download-info {
@@ -276,8 +333,12 @@ class DownloadDialog(ModalScreen[Optional[str]]):
             if self._info_lines:
                 yield Static("\n".join(self._info_lines), id="download-info")
             with Horizontal(id="download-actions"):
-                yield Button("Cancel", id="download-cancel", compact=True)
-                yield Button("Download", id="download-ok", compact=True)
+                with Vertical(classes="download-action"):
+                    yield Button("Cancel", id="download-cancel", compact=True)
+                    yield Static("Esc", classes="download-hint", markup=False)
+                with Vertical(classes="download-action download-action-right"):
+                    yield Button("Download", id="download-ok", compact=True)
+                    yield Static("Enter", classes="download-hint", markup=False)
 
     def on_mount(self) -> None:
         self.query_one("#download-path", Input).focus()
@@ -299,12 +360,16 @@ class DownloadDialog(ModalScreen[Optional[str]]):
             return
         self.dismiss(value)
 
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
 
 ONE_MB = 1024**2
 HUNDRED_MB = 100 * ONE_MB
 ONE_GB = 1024**3
 TEN_GB = 10 * ONE_GB
 DEEP_SCAN_MAX_KEYS = 50000
+ESC_QUIT_WINDOW_SECONDS = 1.0
 
 
 def format_size(size: int) -> str:
@@ -331,10 +396,59 @@ def size_style(size: int) -> str:
     return "bold red"
 
 
-def size_cell(label: str, size: Optional[int]) -> str | Align:
+class EllipsisCell:
+    def __init__(
+        self,
+        label: str,
+        style: str | Style = "",
+        justify: str = "left",
+    ) -> None:
+        self.label = label or ""
+        self.style = style
+        self.justify = justify
+
+    def __rich_console__(self, console, options):
+        if not hasattr(options, "max_width"):
+            options = console.options
+        width = getattr(options, "max_width", None)
+        text = Text(
+            self.label, style=self.style, overflow="ellipsis", no_wrap=True, end=""
+        )
+        if width is None:
+            yield text
+            return
+        text.truncate(width, overflow="ellipsis")
+        padding = max(0, width - text.cell_len)
+        if self.justify == "right":
+            text.pad_left(padding)
+        elif self.justify == "center":
+            left = padding // 2
+            right = padding - left
+            if left:
+                text.pad_left(left)
+            if right:
+                text.pad_right(right)
+        else:
+            text.pad_right(padding)
+        yield text
+
+    def __rich_measure__(self, console, options) -> Measurement:
+        if not hasattr(options, "max_width"):
+            options = console.options
+        text = Text(self.label, style=self.style, end="")
+        return Measurement.get(console, options, text)
+
+
+def ellipsis_text(
+    label: str, style: str | Style = "", justify: str = "left"
+) -> EllipsisCell:
+    return EllipsisCell(label, style=style, justify=justify)
+
+
+def size_cell(label: str, size: Optional[int]) -> EllipsisCell:
     if not label or size is None:
-        return label
-    return Align.right(Text(label, style=size_style(size)))
+        return ellipsis_text(label)
+    return ellipsis_text(label, style=size_style(size), justify="right")
 
 
 def row_icon(info: RowInfo) -> str:
@@ -379,18 +493,63 @@ def modified_style(value: Optional[datetime]) -> str:
     return colors[index]
 
 
-def modified_cell(label: str, value: Optional[datetime]) -> str | Text:
+def modified_cell(label: str, value: Optional[datetime]) -> EllipsisCell:
     if not label or value is None:
-        return label
+        return ellipsis_text(label)
     style = modified_style(value)
     if not style:
-        return label
-    return Text(label, style=style)
+        return ellipsis_text(label)
+    return ellipsis_text(label, style=style)
 
 
 def display_segment(full_prefix: str, parent_prefix: str) -> str:
     name = full_prefix[len(parent_prefix) :] if parent_prefix else full_prefix
     return name.strip("/")
+
+
+def kind_for_row(info: RowInfo) -> str:
+    if info.kind in {"prefix", "bucket", "parent"}:
+        return "dir"
+    if info.kind != "object" or not info.key:
+        return ""
+    name = info.key.rsplit("/", 1)[-1]
+    return kind_from_name(name)
+
+
+def kind_from_name(name: str) -> str:
+    suffixes = PurePosixPath(name).suffixes
+    if suffixes and suffixes[-1].lower() == ".gz":
+        suffixes = suffixes[:-1]
+    if not suffixes:
+        return "file"
+    ext = suffixes[-1].lstrip(".").lower()
+    if not ext:
+        return "file"
+    mapping = {
+        "fa": "fasta",
+        "fna": "fasta",
+        "fasta": "fasta",
+        "ffn": "fasta",
+        "faa": "fasta",
+        "frn": "fasta",
+        "fq": "fastq",
+        "fastq": "fastq",
+        "bam": "bam",
+        "sam": "sam",
+        "cram": "cram",
+        "txt": "txt",
+        "csv": "csv",
+        "tsv": "tsv",
+        "json": "json",
+        "ndjson": "ndjson",
+        "parquet": "parquet",
+        "vcf": "vcf",
+        "bed": "bed",
+        "gff": "gff",
+        "gff3": "gff3",
+        "gtf": "gtf",
+    }
+    return mapping.get(ext, ext)
 
 
 class S3Browser(App):
@@ -563,6 +722,7 @@ class S3Browser(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
+        ("escape", "confirm_quit", "Quit x2"),
         ("r", "refresh", "Refresh"),
         ("enter", "open", "Open"),
         ("backspace", "up", "Up"),
@@ -588,7 +748,7 @@ class S3Browser(App):
         self._load_token = 0
         self._content_token = 0
         self._canonical_path = "s3://"
-        self._content_rows: list[tuple[str, str, str, RowInfo]] = []
+        self._content_rows: list[tuple[str, str, str, str, RowInfo]] = []
         self._active_filter = ""
         self._pending_created: list[tuple[object, str, tuple]] = []
         self._pending_prev_node: Optional[object] = None
@@ -615,8 +775,10 @@ class S3Browser(App):
         self._filter_input_value = ""
         self._col_icon = None
         self._col_name = None
+        self._col_kind = None
         self._col_size = None
         self._col_modified = None
+        self._quit_escape_deadline = 0.0
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -671,11 +833,12 @@ class S3Browser(App):
         self.preview_more = self.query_one("#preview-more", Button)
         self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
         self._col_icon = self.s3_table.add_column("", width=2)
-        self._col_name, self._col_size, self._col_modified = self.s3_table.add_columns(
-            "Name",
-            "Size",
-            "Modified",
-        )
+        (
+            self._col_name,
+            self._col_kind,
+            self._col_size,
+            self._col_modified,
+        ) = self.s3_table.add_columns("Name", "Kind", "Size", "Modified")
         self._update_sort_headers()
         self.s3_table.cursor_type = "row"
         self.s3_table.zebra_stripes = True
@@ -733,7 +896,7 @@ class S3Browser(App):
     def _resize_table_columns(self) -> None:
         if not hasattr(self, "s3_table"):
             return
-        if not self._col_name:
+        if not self._col_name or not self._col_kind:
             return
         table = self.s3_table
         total_width = table.content_region.width
@@ -741,6 +904,10 @@ class S3Browser(App):
             return
         padding = table.cell_padding
         icon_width = 2
+        kind_content = (
+            table.columns[self._col_kind].content_width if self._col_kind else 6
+        )
+        kind_base = max(4, min(kind_content, 8))
         size_base = max(
             10,
             table.columns[self._col_size].content_width if self._col_size else 10,
@@ -755,24 +922,29 @@ class S3Browser(App):
             8,
             table.columns[self._col_name].content_width if self._col_name else 8,
         )
-        available_content = total_width - (2 * padding * 4)
+        available_content = total_width - (2 * padding * 5)
         if available_content <= 0:
             return
-        content_total = icon_width + size_base + modified_base + name_base
+        content_total = icon_width + size_base + modified_base + name_base + kind_base
         if content_total >= available_content:
             name_width = max(
-                1, available_content - (icon_width + size_base + modified_base)
+                1,
+                available_content
+                - (icon_width + size_base + modified_base + kind_base),
             )
             size_width = size_base
             modified_width = modified_base
+            kind_width = kind_base
         else:
             extra = available_content - content_total
-            name_cap = max(name_base, int(available_content * 0.6))
-            name_extra = min(extra, max(0, name_cap - name_base))
+            size_extra = int(extra * 0.08)
+            kind_extra = int(extra * 0.04)
+            modified_extra = int(extra * 0.2)
+            name_extra = extra - size_extra - kind_extra - modified_extra
+            size_width = size_base + size_extra
+            modified_width = modified_base + modified_extra
+            kind_width = kind_base + kind_extra
             name_width = name_base + name_extra
-            remaining = extra - name_extra
-            size_width = size_base
-            modified_width = modified_base + remaining
 
         def apply_width(column_key, width: int) -> None:
             column = table.columns.get(column_key)
@@ -782,6 +954,7 @@ class S3Browser(App):
             column.auto_width = False
 
         apply_width(self._col_icon, icon_width)
+        apply_width(self._col_kind, kind_width)
         apply_width(self._col_size, size_width)
         apply_width(self._col_modified, modified_width)
         apply_width(self._col_name, name_width)
@@ -796,6 +969,18 @@ class S3Browser(App):
 
     async def action_refresh(self) -> None:
         await self.refresh_buckets()
+
+    def action_confirm_quit(self) -> None:
+        now = monotonic()
+        if now <= self._quit_escape_deadline:
+            self._quit_escape_deadline = 0.0
+            self.exit()
+            return
+        self._quit_escape_deadline = now + ESC_QUIT_WINDOW_SECONDS
+        self.notify(
+            "Press Esc again within 1 second to quit.",
+            severity="warning",
+        )
 
     async def action_open(self) -> None:
         if self.focused is self.s3_table:
@@ -819,11 +1004,17 @@ class S3Browser(App):
         if not selected:
             row_key = self._row_key_for_cursor()
             if row_key is None:
-                self.notify("Select a file to download.", severity="warning")
+                self.notify("Select a file or folder to download.", severity="warning")
                 return
             info = self._row_info.get(row_key)
-            if not info or info.kind != "object" or not info.key or not info.bucket:
-                self.notify("Select a file to download.", severity="warning")
+            if not info:
+                self.notify("Select a file or folder to download.", severity="warning")
+                return
+            if info.kind == "prefix":
+                await self._download_prefix(info)
+                return
+            if info.kind != "object" or not info.key or not info.bucket:
+                self.notify("Select a file or folder to download.", severity="warning")
                 return
             selected = [info]
 
@@ -869,6 +1060,54 @@ class S3Browser(App):
             self.notify(f"{exc}", severity="error")
             return
         self.notify(f"Downloaded to {destination}", severity="information")
+
+    async def _download_prefix(self, info: RowInfo) -> None:
+        if not info.bucket or info.prefix is None:
+            self.notify("Select a folder to download.", severity="warning")
+            return
+        default_dir = str(
+            Path.home() / "Downloads" / self._prefix_download_name(info)
+        )
+        info_lines = self._download_prefix_info_lines(info)
+        target = await self.push_screen_wait(
+            DownloadDialog(
+                default_dir, label="Download folder to:", info_lines=info_lines
+            )
+        )
+        if not target:
+            return
+        target_dir = self._resolve_prefix_download_dir(target, info)
+        self.notify("Listing files...", severity="information")
+        try:
+            objects = await self.service.list_objects_recursive(
+                info.profile, info.bucket, info.prefix
+            )
+        except Exception as exc:
+            self.notify(f"{exc}", severity="error")
+            return
+        if not objects:
+            self.notify("No files to download.", severity="warning")
+            return
+        self.notify(
+            f"Downloading {len(objects)} files...", severity="information"
+        )
+        base_prefix = info.prefix or ""
+        if base_prefix and not base_prefix.endswith("/"):
+            base_prefix = f"{base_prefix}/"
+        try:
+            for obj in objects:
+                if base_prefix and obj.key.startswith(base_prefix):
+                    relative = obj.key[len(base_prefix) :]
+                else:
+                    relative = obj.key
+                destination = str(target_dir / relative)
+                await self.service.download_object(
+                    info.profile, info.bucket, obj.key, destination
+                )
+        except Exception as exc:
+            self.notify(f"{exc}", severity="error")
+            return
+        self.notify(f"Downloaded to {target_dir}", severity="information")
 
     async def action_preview_more(self) -> None:
         if (
@@ -957,6 +1196,7 @@ class S3Browser(App):
             return
         sort_map = {
             self._col_name: "name",
+            self._col_kind: "kind",
             self._col_size: "size",
             self._col_modified: "modified",
         }
@@ -1044,7 +1284,7 @@ class S3Browser(App):
         canonical = path if path.endswith("/") else f"{path}/"
         self._set_path_value(path, canonical=canonical, suppress_filter=True)
         self._clear_table()
-        self.s3_table.add_row("", "Loading...", "", "")
+        self.s3_table.add_row("", "Loading...", "", "", "")
         try:
             prefixes, objects, has_any = await self.service.list_prefixes_and_objects(
                 info.profile, info.bucket, info.prefix
@@ -1062,10 +1302,16 @@ class S3Browser(App):
                 return
             self._clear_table()
             self._content_rows = [
-                ("Access denied or unavailable", "", "", RowInfo(kind="error"))
+                ("Access denied or unavailable", "", "", "", RowInfo(kind="error"))
             ]
             self._active_filter = ""
-            self._add_row("Access denied or unavailable", "", "", RowInfo(kind="error"))
+            self._add_row(
+                "Access denied or unavailable",
+                "",
+                "",
+                "",
+                RowInfo(kind="error"),
+            )
             self.notify(f"{exc}", severity="error")
             return
         if not has_any and info.prefix:
@@ -1089,37 +1335,41 @@ class S3Browser(App):
         self._sync_prefix_children(node, info, prefixes)
         prefixes_sorted = sorted(prefixes)
         objects_sorted = sorted(objects, key=lambda o: o.key.lower())
-        rows: list[tuple[str, str, str, RowInfo]] = []
+        rows: list[tuple[str, str, str, str, RowInfo]] = []
         for prefix in prefixes_sorted:
             name = display_segment(prefix, info.prefix)
+            row_info = RowInfo(
+                kind="prefix",
+                profile=info.profile,
+                bucket=info.bucket,
+                prefix=prefix,
+            )
             rows.append(
                 (
                     name,
+                    kind_for_row(row_info),
                     "",
                     "",
-                    RowInfo(
-                        kind="prefix",
-                        profile=info.profile,
-                        bucket=info.bucket,
-                        prefix=prefix,
-                    ),
+                    row_info,
                 )
             )
         for obj in objects_sorted:
             name = display_segment(obj.key, info.prefix)
+            row_info = RowInfo(
+                kind="object",
+                profile=info.profile,
+                bucket=info.bucket,
+                key=obj.key,
+                size=obj.size,
+                last_modified=obj.last_modified,
+            )
             rows.append(
                 (
                     name,
+                    kind_for_row(row_info),
                     format_size(obj.size),
                     format_time(obj.last_modified),
-                    RowInfo(
-                        kind="object",
-                        profile=info.profile,
-                        bucket=info.bucket,
-                        key=obj.key,
-                        size=obj.size,
-                        last_modified=obj.last_modified,
-                    ),
+                    row_info,
                 )
             )
         self._content_rows = rows
@@ -1143,11 +1393,12 @@ class S3Browser(App):
         self._filter_input_value = ""
         self._preview_token += 1
         suppress_history = self._consume_history_suppression()
-        rows: list[tuple[str, str, str, RowInfo]] = []
+        rows: list[tuple[str, str, str, str, RowInfo]] = []
         for bucket in self.buckets:
             rows.append(
                 (
                     bucket.name,
+                    "dir",
                     "",
                     "",
                     RowInfo(kind="bucket", profile=bucket.profile, bucket=bucket.name),
@@ -1419,10 +1670,13 @@ class S3Browser(App):
         self._row_keys = []
         self._row_info = {}
 
-    def _add_row(self, name: str, size: str, modified: str, info: RowInfo) -> None:
+    def _add_row(
+        self, name: str, kind: str, size: str, modified: str, info: RowInfo
+    ) -> None:
         row_key = self.s3_table.add_row(
-            row_icon(info),
-            name,
+            ellipsis_text(row_icon(info)),
+            ellipsis_text(name),
+            ellipsis_text(kind),
             size_cell(size, info.size),
             modified_cell(modified, info.last_modified),
         )
@@ -1551,6 +1805,21 @@ class S3Browser(App):
             return path.parent
         return path
 
+    def _prefix_download_name(self, info: RowInfo) -> str:
+        if info.prefix:
+            parts = [part for part in info.prefix.strip("/").split("/") if part]
+            if parts:
+                return parts[-1]
+        if info.bucket:
+            return info.bucket
+        return "download"
+
+    def _resolve_prefix_download_dir(self, target: str, info: RowInfo) -> Path:
+        path = Path(target).expanduser()
+        if target.endswith(("/", "\\")) or (path.exists() and path.is_dir()):
+            return path / self._prefix_download_name(info)
+        return path
+
     def _object_key(self, info: RowInfo) -> Optional[tuple[Optional[str], str, str]]:
         if info.kind != "object" or not info.bucket or not info.key:
             return None
@@ -1601,6 +1870,12 @@ class S3Browser(App):
         if len(paths) > preview_count:
             lines.append(f"  ... and {len(paths) - preview_count} more")
         return lines
+
+    def _download_prefix_info_lines(self, info: RowInfo) -> list[str]:
+        path = self._path_for_row(info)
+        if not path:
+            return ["Selected folder"]
+        return ["Selected folder:", f"  {path}", "Includes all files under this folder"]
 
     def _update_selection_summary(self) -> None:
         selected = self._selected_object_infos()
@@ -1710,6 +1985,8 @@ class S3Browser(App):
         )
 
     def on_key(self, event: events.Key) -> None:
+        if event.key != "escape" and self._quit_escape_deadline:
+            self._quit_escape_deadline = 0.0
         if self.path_input.has_focus:
             return
         if not event.is_printable or not event.character:
@@ -1797,18 +2074,18 @@ class S3Browser(App):
             remainder = remainder.split("/")[-1]
         return remainder
 
-    def _sorted_content_rows(self) -> list[tuple[str, str, str, RowInfo]]:
+    def _sorted_content_rows(self) -> list[tuple[str, str, str, str, RowInfo]]:
         rows = list(self._content_rows)
         if not self._sort_column:
             return rows
 
-        def is_object(row: tuple[str, str, str, RowInfo]) -> bool:
-            return row[3].kind == "object"
+        def is_object(row: tuple[str, str, str, str, RowInfo]) -> bool:
+            return row[4].kind == "object"
 
         dirs = [row for row in rows if not is_object(row)]
         files = [row for row in rows if is_object(row)]
 
-        def name_key(row: tuple[str, str, str, RowInfo]) -> str:
+        def name_key(row: tuple[str, str, str, str, RowInfo]) -> str:
             return row[0].casefold()
 
         if self._sort_column == "name":
@@ -1816,11 +2093,20 @@ class S3Browser(App):
             files_sorted = sorted(files, key=name_key, reverse=self._sort_reverse)
             return dirs_sorted + files_sorted
 
+        if self._sort_column == "kind":
+            dirs_sorted = sorted(dirs, key=name_key, reverse=self._sort_reverse)
+
+            def kind_key(row: tuple[str, str, str, str, RowInfo]) -> tuple[str, str]:
+                return (row[1].casefold(), name_key(row))
+
+            files_sorted = sorted(files, key=kind_key, reverse=self._sort_reverse)
+            return dirs_sorted + files_sorted
+
         if self._sort_column == "size":
             dirs_sorted = sorted(dirs, key=name_key, reverse=self._sort_reverse)
 
-            def size_key(row: tuple[str, str, str, RowInfo]) -> tuple[int, str]:
-                info = row[3]
+            def size_key(row: tuple[str, str, str, str, RowInfo]) -> tuple[int, str]:
+                info = row[4]
                 return (info.size or 0, name_key(row))
 
             files_sorted = sorted(files, key=size_key, reverse=self._sort_reverse)
@@ -1830,9 +2116,9 @@ class S3Browser(App):
             dirs_sorted = sorted(dirs, key=name_key, reverse=self._sort_reverse)
 
             def modified_key(
-                row: tuple[str, str, str, RowInfo],
+                row: tuple[str, str, str, str, RowInfo],
             ) -> tuple[datetime, str]:
-                info = row[3]
+                info = row[4]
                 return (info.last_modified or datetime.min, name_key(row))
 
             files_sorted = sorted(files, key=modified_key, reverse=self._sort_reverse)
@@ -1845,12 +2131,12 @@ class S3Browser(App):
             return
         self._active_filter = text
         self._clear_table()
-        for name, size, modified, info in self._sorted_content_rows():
+        for name, kind, size, modified, info in self._sorted_content_rows():
             if info.kind == "parent":
-                self._add_row(name, size, modified, info)
+                self._add_row(name, kind, size, modified, info)
                 continue
             if not text or name.startswith(text):
-                self._add_row(name, size, modified, info)
+                self._add_row(name, kind, size, modified, info)
         self.s3_table.call_after_refresh(self._resize_table_columns)
 
     def _profile_for_bucket(self, bucket: str) -> Optional[str]:
@@ -1950,17 +2236,24 @@ class S3Browser(App):
         self._preview_stats_deep = deep
 
     def _update_sort_headers(self) -> None:
-        if not self._col_name or not self._col_size or not self._col_modified:
+        if (
+            not self._col_name
+            or not self._col_kind
+            or not self._col_size
+            or not self._col_modified
+        ):
             return
         if not hasattr(self, "s3_table"):
             return
         column_map = {
             "name": self._col_name,
+            "kind": self._col_kind,
             "size": self._col_size,
             "modified": self._col_modified,
         }
         base_labels = {
             self._col_name: "Name",
+            self._col_kind: "Kind",
             self._col_size: "Size",
             self._col_modified: "Modified",
         }

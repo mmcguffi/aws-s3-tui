@@ -479,6 +479,13 @@ class S3Service:
             self._download_object, profile, bucket, key, destination
         )
 
+    async def list_objects_recursive(
+        self, profile: Optional[str], bucket: str, prefix: str
+    ) -> list[ObjectInfo]:
+        return await asyncio.to_thread(
+            self._list_objects_recursive, profile, bucket, prefix
+        )
+
     def _download_object(
         self, profile: Optional[str], bucket: str, key: str, destination: str
     ) -> str:
@@ -489,3 +496,44 @@ class S3Service:
             os.makedirs(parent, exist_ok=True)
         client.download_file(bucket, key, dest_path)
         return dest_path
+
+    def _list_objects_recursive(
+        self, profile: Optional[str], bucket: str, prefix: str
+    ) -> list[ObjectInfo]:
+        client = self._client(profile)
+        base_prefix = prefix or ""
+        if base_prefix and not base_prefix.endswith("/"):
+            base_prefix = f"{base_prefix}/"
+        continuation: Optional[str] = None
+        objects: list[ObjectInfo] = []
+        while True:
+            kwargs = {
+                "Bucket": bucket,
+                "Prefix": base_prefix,
+                "MaxKeys": 1000,
+            }
+            if continuation:
+                kwargs["ContinuationToken"] = continuation
+            response = client.list_objects_v2(**kwargs)
+            contents = response.get("Contents", [])
+            for entry in contents:
+                key = entry.get("Key")
+                if not key:
+                    continue
+                if key.endswith("/"):
+                    continue
+                if base_prefix and key == base_prefix:
+                    continue
+                objects.append(
+                    ObjectInfo(
+                        key=key,
+                        size=int(entry.get("Size", 0)),
+                        last_modified=entry.get("LastModified"),
+                        storage_class=entry.get("StorageClass"),
+                    )
+                )
+            if response.get("IsTruncated"):
+                continuation = response.get("NextContinuationToken")
+            else:
+                break
+        return objects
