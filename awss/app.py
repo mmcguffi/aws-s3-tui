@@ -740,6 +740,7 @@ class S3Browser(App):
         self.service = S3Service(profiles=profiles, region=region)
         self.buckets: list[BucketInfo] = []
         self.bucket_nodes: dict[tuple[Optional[str], str], object] = {}
+        self.bucket_profile_candidates: dict[str, list[Optional[str]]] = {}
         self.prefix_nodes: dict[tuple[Optional[str], str, str], object] = {}
         self.loaded_nodes: set[int] = set()
         self.current_context: Optional[NodeInfo] = None
@@ -1232,11 +1233,42 @@ class S3Browser(App):
         self.loaded_nodes.add(node.id)
         self._sync_prefix_children(node, info, prefixes)
 
+    def _collect_bucket_profile_candidates(
+        self, buckets: list[BucketInfo]
+    ) -> dict[str, list[Optional[str]]]:
+        candidates: dict[str, list[Optional[str]]] = {}
+        for bucket in buckets:
+            values = candidates.setdefault(bucket.name, [])
+            if bucket.profile not in values:
+                values.append(bucket.profile)
+        return candidates
+
+    def _render_bucket_nodes(self, buckets: list[BucketInfo]) -> None:
+        self.s3_tree.clear()
+        self.bucket_nodes.clear()
+        self.prefix_nodes.clear()
+        self.loaded_nodes.clear()
+        self.buckets = sorted(buckets, key=lambda b: b.name.lower())
+        for bucket in self.buckets:
+            values = self.bucket_profile_candidates.setdefault(bucket.name, [])
+            if bucket.profile not in values:
+                values.append(bucket.profile)
+        for bucket in self.buckets:
+            node = self.s3_tree.root.add(
+                self._bucket_label(bucket),
+                data=NodeInfo(profile=bucket.profile, bucket=bucket.name, prefix=""),
+                allow_expand=True,
+            )
+            self.bucket_nodes[(bucket.profile, bucket.name)] = node
+        self.s3_tree.root.expand()
+        self.s3_tree.select_node(self.s3_tree.root)
+
     async def refresh_buckets(self) -> None:
         self._load_token += 1
         token = self._load_token
         self.s3_tree.clear()
         self.bucket_nodes.clear()
+        self.bucket_profile_candidates.clear()
         self.prefix_nodes.clear()
         self.loaded_nodes.clear()
         self.current_context = None
@@ -1252,23 +1284,178 @@ class S3Browser(App):
         self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
         self.path_input.placeholder = "Loading buckets..."
         self.s3_tree.root.expand()
+        cached: list[BucketInfo] = []
+        load_bucket_cache = getattr(self.service, "load_bucket_cache", None)
+        if callable(load_bucket_cache):
+            cached = await asyncio.to_thread(load_bucket_cache)
+        if token != self._load_token:
+            return
+        has_cached = bool(cached)
+        if has_cached:
+            self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
+                cached
+            )
+            self.path_input.placeholder = "Refreshing buckets..."
+            self._render_bucket_nodes(cached)
+
         buckets, errors = await self.service.list_buckets_all()
         if token != self._load_token:
             return
+        self.bucket_profile_candidates = self._collect_bucket_profile_candidates(buckets)
         buckets = await self.service.select_best_bucket_profiles(buckets)
+        if token != self._load_token:
+            return
+        if buckets:
+            save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
+            if callable(save_bucket_cache):
+                await asyncio.to_thread(save_bucket_cache, buckets)
+        if not buckets and has_cached and errors:
+            self.path_input.placeholder = "bucket/prefix/ (cached)"
+            self.notify("Using cached buckets because live refresh failed.", severity="warning")
+            if errors:
+                failed = ", ".join((profile or "default") for profile, _exc in errors[:3])
+                extra = ""
+                if len(errors) > 3:
+                    extra = f" (+{len(errors) - 3} more)"
+                self.notify(
+                    f"Some credentials could not list buckets: {failed}{extra}",
+                    severity="warning",
+                )
+            return
         self.path_input.placeholder = "bucket/prefix/"
-        self.buckets = sorted(buckets, key=lambda b: b.name.lower())
+        self._render_bucket_nodes(buckets)
         if errors:
-            self.notify("Some credentials could not list buckets.", severity="warning")
-        for bucket in self.buckets:
-            node = self.s3_tree.root.add(
-                self._bucket_label(bucket),
-                data=NodeInfo(profile=bucket.profile, bucket=bucket.name, prefix=""),
-                allow_expand=True,
+            failed = ", ".join((profile or "default") for profile, _exc in errors[:3])
+            extra = ""
+            if len(errors) > 3:
+                extra = f" (+{len(errors) - 3} more)"
+            self.notify(
+                f"Some credentials could not list buckets: {failed}{extra}",
+                severity="warning",
             )
-            self.bucket_nodes[(bucket.profile, bucket.name)] = node
-        self.s3_tree.root.expand()
-        self.s3_tree.select_node(self.s3_tree.root)
+
+    def _profile_candidates_for_bucket(self, bucket: str) -> list[Optional[str]]:
+        candidates = list(self.bucket_profile_candidates.get(bucket, []))
+        if not candidates:
+            profile = self._profile_for_bucket(bucket)
+            if profile not in candidates:
+                candidates.append(profile)
+        profile_order = {}
+        if hasattr(self.service, "profiles"):
+            service_profiles = list(getattr(self.service, "profiles"))
+            profile_order = {
+                profile: index for index, profile in enumerate(service_profiles)
+            }
+            for profile in service_profiles:
+                if profile not in candidates:
+                    candidates.append(profile)
+        candidates = sorted(
+            candidates,
+            key=lambda profile: (
+                profile is None,
+                profile_order.get(profile, len(profile_order)),
+            ),
+        )
+        return candidates
+
+    def _switch_bucket_profile(
+        self,
+        bucket: str,
+        old_profile: Optional[str],
+        new_profile: Optional[str],
+        current_node: object,
+    ) -> None:
+        if old_profile == new_profile:
+            return
+        old_bucket_key = (old_profile, bucket)
+        bucket_node = self.bucket_nodes.get(old_bucket_key)
+        if bucket_node is not None:
+            self.bucket_nodes.pop(old_bucket_key, None)
+            self.bucket_nodes[(new_profile, bucket)] = bucket_node
+            try:
+                bucket_node.data = NodeInfo(profile=new_profile, bucket=bucket, prefix="")
+            except Exception:
+                pass
+            try:
+                label = self._bucket_label(BucketInfo(name=bucket, profile=new_profile))
+                bucket_node.set_label(label)
+            except Exception:
+                pass
+        else:
+            replacement = self.bucket_nodes.pop(old_bucket_key, None)
+            if replacement is not None:
+                self.bucket_nodes[(new_profile, bucket)] = replacement
+
+        current_data = getattr(current_node, "data", None)
+        if isinstance(current_data, NodeInfo):
+            if current_data.bucket == bucket and current_data.profile == old_profile:
+                try:
+                    current_node.data = NodeInfo(
+                        profile=new_profile,
+                        bucket=current_data.bucket,
+                        prefix=current_data.prefix,
+                    )
+                except Exception:
+                    pass
+
+        updated: list[BucketInfo] = []
+        for info in self.buckets:
+            if info.name == bucket:
+                updated.append(BucketInfo(name=info.name, profile=new_profile))
+            else:
+                updated.append(info)
+        self.buckets = updated
+
+        prefix_updates: list[tuple[tuple[Optional[str], str, str], tuple[Optional[str], str, str], object]] = []
+        for key, prefix_node in self.prefix_nodes.items():
+            profile, key_bucket, prefix = key
+            if key_bucket != bucket or profile != old_profile:
+                continue
+            new_key = (new_profile, bucket, prefix)
+            prefix_updates.append((key, new_key, prefix_node))
+        for old_key, new_key, prefix_node in prefix_updates:
+            self.prefix_nodes.pop(old_key, None)
+            self.prefix_nodes[new_key] = prefix_node
+            data = getattr(prefix_node, "data", None)
+            if isinstance(data, NodeInfo):
+                try:
+                    prefix_node.data = NodeInfo(
+                        profile=new_profile,
+                        bucket=data.bucket,
+                        prefix=data.prefix,
+                    )
+                except Exception:
+                    pass
+
+        candidates = self.bucket_profile_candidates.setdefault(bucket, [])
+        if new_profile not in candidates:
+            candidates.append(new_profile)
+
+    async def _try_bucket_profile_fallback(
+        self, info: NodeInfo, node: object
+    ) -> Optional[tuple[NodeInfo, list[str], list[ObjectInfo], bool]]:
+        candidates = self._profile_candidates_for_bucket(info.bucket)
+        for profile in candidates:
+            if profile == info.profile:
+                continue
+            try:
+                prefixes, objects, has_any = await self.service.list_prefixes_and_objects(
+                    profile, info.bucket, info.prefix
+                )
+            except Exception:
+                continue
+            new_info = NodeInfo(profile=profile, bucket=info.bucket, prefix=info.prefix)
+            self._switch_bucket_profile(info.bucket, info.profile, profile, node)
+            self.current_context = new_info
+            self.notify(
+                f"Using profile '{profile or 'default'}' for bucket '{info.bucket}'.",
+                severity="warning",
+            )
+            save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
+            if callable(save_bucket_cache):
+                await asyncio.to_thread(save_bucket_cache, self.buckets)
+            return new_info, prefixes, objects, has_any
+        return None
 
     async def show_prefix(self, node, info: NodeInfo) -> None:
         self.current_context = info
@@ -1290,30 +1477,34 @@ class S3Browser(App):
                 info.profile, info.bucket, info.prefix
             )
         except Exception as exc:
-            if self._pending_target_node is node and self._pending_created:
-                prev_node = self._pending_prev_node
-                self._remove_pending_nodes()
-                self._clear_pending()
-                if prev_node is not None:
-                    self.s3_tree.select_node(prev_node)
-                else:
-                    self.s3_tree.select_node(self.s3_tree.root)
+            fallback = await self._try_bucket_profile_fallback(info, node)
+            if fallback is not None:
+                info, prefixes, objects, has_any = fallback
+            else:
+                if self._pending_target_node is node and self._pending_created:
+                    prev_node = self._pending_prev_node
+                    self._remove_pending_nodes()
+                    self._clear_pending()
+                    if prev_node is not None:
+                        self.s3_tree.select_node(prev_node)
+                    else:
+                        self.s3_tree.select_node(self.s3_tree.root)
+                    self.notify(f"{exc}", severity="error")
+                    return
+                self._clear_table()
+                self._content_rows = [
+                    ("Access denied or unavailable", "", "", "", RowInfo(kind="error"))
+                ]
+                self._active_filter = ""
+                self._add_row(
+                    "Access denied or unavailable",
+                    "",
+                    "",
+                    "",
+                    RowInfo(kind="error"),
+                )
                 self.notify(f"{exc}", severity="error")
                 return
-            self._clear_table()
-            self._content_rows = [
-                ("Access denied or unavailable", "", "", "", RowInfo(kind="error"))
-            ]
-            self._active_filter = ""
-            self._add_row(
-                "Access denied or unavailable",
-                "",
-                "",
-                "",
-                RowInfo(kind="error"),
-            )
-            self.notify(f"{exc}", severity="error")
-            return
         if not has_any and info.prefix:
             if self._pending_target_node is node and self._pending_created:
                 prev_node = self._pending_prev_node

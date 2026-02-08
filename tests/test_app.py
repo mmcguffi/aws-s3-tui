@@ -10,6 +10,16 @@ from awss.app import (
     format_size,
     format_time,
 )
+from awss.s3 import BucketInfo
+
+
+class _DummyNode:
+    def __init__(self, data) -> None:
+        self.data = data
+        self.label = None
+
+    def set_label(self, value) -> None:
+        self.label = value
 
 
 class TestAppHelpers(unittest.TestCase):
@@ -87,6 +97,32 @@ class TestAppHelpers(unittest.TestCase):
         app._canonical_path = "s3://my-bucket/a/b/"
         self.assertEqual(app._derive_filter("s3://my-bucket/a/b/fo"), "fo")
         self.assertEqual(app._derive_filter("my-bucket/a/b/fo"), "fo")
+
+    def test_profile_candidates_for_bucket_prefers_non_default(self) -> None:
+        app = S3Browser(profiles=["default", "dev", "prod"])
+        app.bucket_profile_candidates = {"bucket-a": [None, "prod", "dev"]}
+        self.assertEqual(
+            app._profile_candidates_for_bucket("bucket-a"),
+            ["dev", "prod", None],
+        )
+
+    def test_switch_bucket_profile_updates_structures(self) -> None:
+        app = S3Browser(profiles=["default", "dev"])
+        app.buckets = [BucketInfo(name="bucket-a", profile=None)]
+        bucket_node = _DummyNode(NodeInfo(profile=None, bucket="bucket-a", prefix=""))
+        prefix_node = _DummyNode(NodeInfo(profile=None, bucket="bucket-a", prefix="foo/"))
+        app.bucket_nodes[(None, "bucket-a")] = bucket_node
+        app.prefix_nodes[(None, "bucket-a", "foo/")] = prefix_node
+        app.bucket_profile_candidates = {"bucket-a": [None, "dev"]}
+
+        app._switch_bucket_profile("bucket-a", None, "dev", prefix_node)
+
+        self.assertNotIn((None, "bucket-a"), app.bucket_nodes)
+        self.assertIn(("dev", "bucket-a"), app.bucket_nodes)
+        self.assertEqual(app.buckets[0], BucketInfo(name="bucket-a", profile="dev"))
+        self.assertNotIn((None, "bucket-a", "foo/"), app.prefix_nodes)
+        self.assertIn(("dev", "bucket-a", "foo/"), app.prefix_nodes)
+        self.assertEqual(prefix_node.data.profile, "dev")
 
 
 if __name__ == "__main__":

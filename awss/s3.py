@@ -29,11 +29,17 @@ class ObjectInfo:
 
 class S3Service:
     def __init__(
-        self, profiles: Optional[list[str]] = None, region: Optional[str] = None
+        self,
+        profiles: Optional[list[str]] = None,
+        region: Optional[str] = None,
+        cache_path: Optional[Path] = None,
+        cache_ttl_seconds: int = 3600,
     ) -> None:
         self.profiles = self._normalize_profiles(profiles)
         self._region = region
         self._clients: dict[str, object] = {}
+        self._bucket_cache_path = cache_path or self._default_bucket_cache_path()
+        self._bucket_cache_ttl_seconds = max(0, int(cache_ttl_seconds))
 
     def _normalize_profiles(
         self, profiles: Optional[Iterable[str]]
@@ -60,6 +66,14 @@ class S3Service:
 
     def _profile_label(self, profile: Optional[str]) -> str:
         return profile or "default"
+
+    def _default_bucket_cache_path(self) -> Path:
+        config_home = os.environ.get("XDG_CONFIG_HOME")
+        if config_home:
+            base = Path(config_home).expanduser()
+        else:
+            base = Path.home() / ".config"
+        return base / "awss" / "bucket-cache.json"
 
     def _client(self, profile: Optional[str]):
         key = self._profile_key(profile)
@@ -108,56 +122,97 @@ class S3Service:
         if all(len(profiles) == 1 for profiles in by_name.values()):
             return buckets
 
-        tasks: list[asyncio.Future] = []
-        task_keys: list[tuple[str, Optional[str]]] = []
-        for name, profiles in by_name.items():
-            if len(profiles) < 2:
-                continue
-            for profile in profiles:
-                task_keys.append((name, profile))
-                tasks.append(
-                    asyncio.to_thread(self._score_profile_for_bucket, name, profile)
-                )
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        scores: dict[tuple[str, Optional[str]], int] = {}
-        for key, result in zip(task_keys, results):
-            if isinstance(result, Exception):
-                scores[key] = 0
-            else:
-                scores[key] = int(result)
-
+        preferred_profiles = self.load_cached_bucket_preferences()
         profile_rank = {profile: index for index, profile in enumerate(self.profiles)}
+        probe_keys: list[tuple[str, Optional[str]]] = []
+        probe_tasks: list[asyncio.Future] = []
+        unresolved: list[tuple[str, list[Optional[str]]]] = []
         resolved: list[BucketInfo] = []
         for name, profiles in by_name.items():
             if len(profiles) == 1:
                 resolved.append(BucketInfo(name=name, profile=profiles[0]))
                 continue
 
+            has_non_default = any(profile is not None for profile in profiles)
+            if name in preferred_profiles:
+                preferred = preferred_profiles[name]
+                if preferred in profiles and (preferred is not None or not has_non_default):
+                    resolved.append(BucketInfo(name=name, profile=preferred))
+                    continue
+
+            # Probe only non-default candidates when multiple profiles can see a bucket.
+            # This keeps startup fast while still preferring profiles with usable access.
+            candidates = [profile for profile in profiles if profile is not None]
+            if not candidates:
+                best_profile = min(
+                    profiles, key=lambda profile: profile_rank.get(profile, len(profile_rank))
+                )
+                resolved.append(BucketInfo(name=name, profile=best_profile))
+                continue
+
+            unresolved.append((name, profiles))
+            for profile in candidates:
+                probe_keys.append((name, profile))
+                probe_tasks.append(
+                    asyncio.to_thread(self._score_profile_for_bucket, name, profile)
+                )
+
+        probe_scores: dict[tuple[str, Optional[str]], int] = {}
+        if probe_tasks:
+            probe_results = await asyncio.gather(*probe_tasks, return_exceptions=True)
+            for key, result in zip(probe_keys, probe_results):
+                if isinstance(result, Exception):
+                    probe_scores[key] = 0
+                else:
+                    probe_scores[key] = int(result)
+
+        for name, profiles in unresolved:
+            preferred = preferred_profiles.get(name) if name in preferred_profiles else None
+            candidates = [profile for profile in profiles if profile is not None]
+            if not candidates:
+                best_profile = min(
+                    profiles, key=lambda profile: profile_rank.get(profile, len(profile_rank))
+                )
+                resolved.append(BucketInfo(name=name, profile=best_profile))
+                continue
+
             def profile_key(profile: Optional[str]) -> tuple[int, int]:
-                score = scores.get((name, profile), 0)
+                score = probe_scores.get((name, profile), 0)
                 rank = profile_rank.get(profile, len(profile_rank))
                 return (score, -rank)
 
-            best_profile = max(profiles, key=profile_key)
+            best_profile = max(candidates, key=profile_key)
+            best_score = probe_scores.get((name, best_profile), 0)
+            if best_score <= 0:
+                if preferred in profiles:
+                    best_profile = preferred
+                elif None in profiles:
+                    best_profile = None
+                else:
+                    best_profile = min(
+                        candidates,
+                        key=lambda profile: profile_rank.get(profile, len(profile_rank)),
+                    )
             resolved.append(BucketInfo(name=name, profile=best_profile))
         return resolved
 
     def _score_profile_for_bucket(self, bucket: str, profile: Optional[str]) -> int:
         client = self._client(profile)
         try:
-            response = client.list_objects_v2(Bucket=bucket, MaxKeys=1)
+            response = client.list_objects_v2(Bucket=bucket, MaxKeys=5)
         except Exception:
             return 0
-        score = 2
+        score = 1
         contents = response.get("Contents", [])
-        if contents:
-            key = contents[0].get("Key")
-            if key:
-                try:
-                    client.head_object(Bucket=bucket, Key=key)
-                    score += 1
-                except Exception:
-                    pass
+        for entry in contents[:3]:
+            key = entry.get("Key")
+            if not key:
+                continue
+            try:
+                client.head_object(Bucket=bucket, Key=key)
+                score += 1
+            except Exception:
+                continue
         return score
 
     def _load_full_config(self) -> dict:
@@ -226,6 +281,98 @@ class S3Service:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
+
+    def _parse_cache_saved_at(self, value: object) -> Optional[datetime]:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def _decode_profile(self, value: object) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized or normalized in {"default", "__default__"}:
+            return None
+        return normalized
+
+    def _read_bucket_cache(self) -> tuple[Optional[datetime], list[BucketInfo]]:
+        try:
+            payload = json.loads(self._bucket_cache_path.read_text())
+        except Exception:
+            return None, []
+        if not isinstance(payload, dict):
+            return None, []
+        items = payload.get("buckets")
+        if not isinstance(items, list):
+            return self._parse_cache_saved_at(payload.get("saved_at")), []
+        buckets: list[BucketInfo] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str):
+                continue
+            stripped = name.strip()
+            if not stripped:
+                continue
+            profile = self._decode_profile(item.get("profile"))
+            buckets.append(BucketInfo(name=stripped, profile=profile))
+        saved_at = self._parse_cache_saved_at(payload.get("saved_at"))
+        return saved_at, buckets
+
+    def load_cached_bucket_preferences(self) -> dict[str, Optional[str]]:
+        buckets = self.load_bucket_cache()
+        preferred: dict[str, Optional[str]] = {}
+        for bucket in buckets:
+            preferred[bucket.name] = bucket.profile
+        return preferred
+
+    def load_bucket_cache(self) -> list[BucketInfo]:
+        saved_at, buckets = self._read_bucket_cache()
+        if not buckets:
+            return []
+        if self._bucket_cache_ttl_seconds <= 0:
+            return buckets
+        if saved_at is None:
+            return []
+        age = datetime.now(timezone.utc) - saved_at
+        if age > timedelta(seconds=self._bucket_cache_ttl_seconds):
+            return []
+        return buckets
+
+    def save_bucket_cache(self, buckets: list[BucketInfo]) -> bool:
+        latest_by_name: dict[str, Optional[str]] = {}
+        for bucket in buckets:
+            latest_by_name[bucket.name] = bucket.profile
+        rows = [
+            {"name": name, "profile": profile}
+            for name, profile in sorted(latest_by_name.items(), key=lambda item: item[0])
+        ]
+        payload = {
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "buckets": rows,
+        }
+        try:
+            self._bucket_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self._bucket_cache_path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(payload, indent=2))
+            temp_path.replace(self._bucket_cache_path)
+        except Exception:
+            return False
+        return True
 
     async def list_buckets_all(
         self,
