@@ -9,6 +9,7 @@ from time import monotonic
 from typing import Optional
 
 from rich.style import Style
+from rich.markup import escape
 from rich.measure import Measurement
 from rich.segment import Segment
 from rich.text import Text
@@ -1219,14 +1220,14 @@ class S3Browser(App):
         if not hasattr(self, "path_profile"):
             return
         if not bucket:
-            self.path_profile.label = "[-]"
+            self.path_profile.label = escape("[-]")
             self.path_profile.disabled = True
             self.path_profile.styles.color = "#8a8a8a"
             return
         access = self._bucket_access_for_name(bucket)
         profile_style = self._bucket_name_style(access).replace("bold ", "")
         self.path_profile.disabled = False
-        self.path_profile.label = f"[{profile or 'default'}]"
+        self.path_profile.label = escape(f"[{profile or 'default'}]")
         self.path_profile.styles.color = profile_style
 
     def _bucket_access_level(self, access: str) -> int:
@@ -1481,7 +1482,7 @@ class S3Browser(App):
             await self.action_preview_more()
             return
         if event.button.id == "path-profile":
-            await self.action_choose_profile()
+            self.action_choose_profile()
             return
         if event.button.id == "nav-back":
             self.action_back()
@@ -1498,7 +1499,10 @@ class S3Browser(App):
         if hasattr(self.path_input, "select_all"):
             self.path_input.select_all()
 
-    async def action_choose_profile(self) -> None:
+    def action_choose_profile(self) -> None:
+        self.run_worker(self._choose_profile_flow(), exclusive=True)
+
+    async def _choose_profile_flow(self) -> None:
         if not self.current_context or not self.current_context.bucket:
             self.notify("Open a bucket to choose profile.", severity="warning")
             return
