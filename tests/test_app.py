@@ -135,7 +135,7 @@ class TestAppHelpers(unittest.TestCase):
         app = S3Browser(profiles=["default"])
         self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_NO_VIEW), "bold red")
         self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_NO_DOWNLOAD), "bold #ff8c00")
-        self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_GOOD), "bold blue")
+        self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_GOOD), "bold #2f80ed")
 
 
 if __name__ == "__main__":

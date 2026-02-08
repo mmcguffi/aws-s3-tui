@@ -575,6 +575,17 @@ class S3Browser(App):
         color: $text;
     }
 
+    #path-profile {
+        width: auto;
+        min-width: 6;
+        height: 1;
+        padding: 0 1;
+        margin-right: 1;
+        content-align: center middle;
+        background: $panel;
+        color: $text-muted;
+    }
+
     #path-input {
         width: 1fr;
         height: 1;
@@ -791,6 +802,7 @@ class S3Browser(App):
         yield Header()
         with Horizontal(id="path-bar"):
             yield Static("s3://", id="path-prefix")
+            yield Static("[-]", id="path-profile")
             yield Input(placeholder="bucket/prefix/", id="path-input")
             yield Button("←", id="nav-back", compact=True)
             yield Button("→", id="nav-forward", compact=True)
@@ -831,6 +843,7 @@ class S3Browser(App):
         self.s3_tree.show_root = False
         self.s3_table = self.query_one("#s3-table", DataTable)
         self.path_input = self.query_one("#path-input", Input)
+        self.path_profile = self.query_one("#path-profile", Static)
         self.nav_back = self.query_one("#nav-back", Button)
         self.nav_forward = self.query_one("#nav-forward", Button)
         self.download_button = self.query_one("#download", Button)
@@ -839,6 +852,7 @@ class S3Browser(App):
         self.preview_status = self.query_one("#preview-status", Static)
         self.preview_more = self.query_one("#preview-more", Button)
         self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
+        self._set_profile_indicator(None)
         self._col_icon = self.s3_table.add_column("", width=2)
         (
             self._col_name,
@@ -981,8 +995,8 @@ class S3Browser(App):
         if access == BUCKET_ACCESS_NO_DOWNLOAD:
             return "bold #ff8c00"
         if access == BUCKET_ACCESS_GOOD:
-            return "bold blue"
-        return "bold blue"
+            return "bold #2f80ed"
+        return "bold #2f80ed"
 
     def _bucket_access_for_name(self, bucket: Optional[str]) -> str:
         if not bucket:
@@ -991,6 +1005,21 @@ class S3Browser(App):
             if info.name == bucket:
                 return info.access
         return BUCKET_ACCESS_UNKNOWN
+
+    def _set_profile_indicator(
+        self, profile: Optional[str], bucket: Optional[str] = None
+    ) -> None:
+        if not hasattr(self, "path_profile"):
+            return
+        if not bucket:
+            self.path_profile.update(Text("[-]", style="dim"))
+            return
+        access = self._bucket_access_for_name(bucket)
+        profile_style = self._bucket_name_style(access)
+        badge = Text("[", style="dim")
+        badge.append(profile or "default", style=profile_style)
+        badge.append("]", style="dim")
+        self.path_profile.update(badge)
 
     async def action_refresh(self) -> None:
         await self.refresh_buckets()
@@ -1306,6 +1335,7 @@ class S3Browser(App):
         self._suppress_history_once = False
         self._sync_nav_buttons()
         self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
+        self._set_profile_indicator(None)
         self.path_input.placeholder = "Loading buckets..."
         self.s3_tree.root.expand()
         cached: list[BucketInfo] = []
@@ -1525,6 +1555,7 @@ class S3Browser(App):
                 new_access=access,
             )
             self.current_context = new_info
+            self._set_profile_indicator(new_info.profile, new_info.bucket)
             self.notify(
                 f"Using profile '{profile or 'default'}' for bucket '{info.bucket}'.",
                 severity="warning",
@@ -1548,6 +1579,7 @@ class S3Browser(App):
             except Exception:
                 pass
         self.current_context = info
+        self._set_profile_indicator(info.profile, info.bucket)
         self._preview_token += 1
         self._clear_selection()
         self._filter_input_value = ""
@@ -1695,6 +1727,7 @@ class S3Browser(App):
             self._record_history(info)
 
     def show_bucket_list(self) -> None:
+        self._set_profile_indicator(None)
         self._clear_table()
         self._clear_selection()
         self._filter_input_value = ""
