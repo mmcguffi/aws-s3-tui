@@ -370,6 +370,55 @@ class DownloadDialog(ModalScreen[Optional[str]]):
         self.dismiss(None)
 
 
+class RefreshOverlay(ModalScreen[None]):
+    CSS = """
+    RefreshOverlay {
+        align: center middle;
+        background: $background 45%;
+    }
+
+    #refresh-overlay-box {
+        width: 56;
+        max-width: 80;
+        min-width: 34;
+        height: auto;
+        padding: 1 2;
+        border: round $panel;
+        background: $panel;
+        color: $text;
+    }
+
+    #refresh-overlay-title {
+        width: 100%;
+        text-style: bold;
+        content-align: center middle;
+    }
+
+    #refresh-overlay-detail {
+        width: 100%;
+        margin-top: 1;
+        color: $text-muted;
+        content-align: center middle;
+    }
+    """
+
+    def __init__(self, title: str, detail: str) -> None:
+        super().__init__()
+        self._title = title
+        self._detail = detail
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="refresh-overlay-box"):
+            yield Static(self._title, id="refresh-overlay-title")
+            yield Static(self._detail, id="refresh-overlay-detail")
+
+    def update_detail(self, detail: str) -> None:
+        self._detail = detail
+        if not self.is_mounted:
+            return
+        self.query_one("#refresh-overlay-detail", Static).update(detail)
+
+
 ONE_MB = 1024**2
 HUNDRED_MB = 100 * ONE_MB
 ONE_GB = 1024**3
@@ -1514,8 +1563,18 @@ class S3Browser(App):
             self.buckets = updated
             return
         old_bucket_key = (old_profile, bucket)
+        source_profile = old_profile
         bucket_node = self.bucket_nodes.get(old_bucket_key)
+        if bucket_node is None:
+            for (profile_key, name), candidate in self.bucket_nodes.items():
+                if name != bucket:
+                    continue
+                source_profile = profile_key
+                bucket_node = candidate
+                break
         if bucket_node is not None:
+            if source_profile is not None or old_bucket_key in self.bucket_nodes:
+                self.bucket_nodes.pop((source_profile, bucket), None)
             self.bucket_nodes.pop(old_bucket_key, None)
             self.bucket_nodes[(new_profile, bucket)] = bucket_node
             try:
@@ -1560,10 +1619,17 @@ class S3Browser(App):
                 updated.append(info)
         self.buckets = updated
 
-        prefix_updates: list[tuple[tuple[Optional[str], str, str], tuple[Optional[str], str, str], object]] = []
+        profile_to_replace = source_profile if bucket_node is not None else old_profile
+        prefix_updates: list[
+            tuple[
+                tuple[Optional[str], str, str],
+                tuple[Optional[str], str, str],
+                object,
+            ]
+        ] = []
         for key, prefix_node in self.prefix_nodes.items():
             profile, key_bucket, prefix = key
-            if key_bucket != bucket or profile != old_profile:
+            if key_bucket != bucket or profile != profile_to_replace:
                 continue
             new_key = (new_profile, bucket, prefix)
             prefix_updates.append((key, new_key, prefix_node))
