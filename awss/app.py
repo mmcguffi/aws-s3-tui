@@ -9,7 +9,6 @@ from time import monotonic
 from typing import Optional
 
 from rich.style import Style
-from rich.markup import escape
 from rich.measure import Measurement
 from rich.segment import Segment
 from rich.text import Text
@@ -1384,15 +1383,30 @@ class S3Browser(App):
         if not hasattr(self, "path_profile"):
             return
         if not bucket:
-            self.path_profile.label = escape("[-]")
+            self.path_profile.label = Text("[-]")
+            self.path_profile.tooltip = None
             self.path_profile.disabled = True
             self.path_profile.styles.color = "#8a8a8a"
             return
         access = self._bucket_access_for_name(bucket)
         profile_style = self._bucket_name_style(access).replace("bold ", "")
+        display, full = self._profile_indicator_parts(profile)
         self.path_profile.disabled = False
-        self.path_profile.label = escape(f"[{profile or 'default'}]")
+        self.path_profile.label = display
+        self.path_profile.tooltip = full
         self.path_profile.styles.color = profile_style
+
+    def _profile_indicator_parts(
+        self, profile: Optional[str], max_profile_chars: int = 18
+    ) -> tuple[Text, str]:
+        profile_name = profile or "default"
+        full = f"[{profile_name}]"
+        limit = max(4, max_profile_chars)
+        if len(profile_name) > limit:
+            visible = f"{profile_name[: limit - 1]}…"
+        else:
+            visible = profile_name
+        return Text(f"[{visible}]"), full
 
     def _bucket_filter_state_payload(self) -> dict[str, bool]:
         return {

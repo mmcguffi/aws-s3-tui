@@ -139,6 +139,14 @@ class TestAppHelpers(unittest.TestCase):
         self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_NO_DOWNLOAD), "bold #ff8c00")
         self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_GOOD), "bold #2f80ed")
 
+    def test_profile_indicator_parts_truncates_long_profile(self) -> None:
+        app = S3Browser(profiles=["default"])
+        label, full = app._profile_indicator_parts("this-is-a-very-long-profile-name")
+        self.assertEqual(full, "[this-is-a-very-long-profile-name]")
+        self.assertTrue(label.plain.startswith("["))
+        self.assertTrue(label.plain.endswith("]"))
+        self.assertIn("…", label.plain)
+
     def test_visible_buckets_respects_filter_state(self) -> None:
         app = S3Browser(profiles=["default"])
         app.buckets = [
