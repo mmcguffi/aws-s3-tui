@@ -535,6 +535,7 @@ class S3Service:
             "hide_no_view": False,
             "hide_no_download": False,
             "hide_empty": False,
+            "only_favorites": False,
         }
         payload = self._read_app_config()
         section = payload.get("bucket_filters")
@@ -546,6 +547,9 @@ class S3Service:
                 section.get("hide_no_download", defaults["hide_no_download"])
             ),
             "hide_empty": bool(section.get("hide_empty", defaults["hide_empty"])),
+            "only_favorites": bool(
+                section.get("only_favorites", defaults["only_favorites"])
+            ),
         }
 
     def save_bucket_filter_state(self, state: dict[str, bool]) -> bool:
@@ -554,7 +558,38 @@ class S3Service:
             "hide_no_view": bool(state.get("hide_no_view", False)),
             "hide_no_download": bool(state.get("hide_no_download", False)),
             "hide_empty": bool(state.get("hide_empty", False)),
+            "only_favorites": bool(state.get("only_favorites", False)),
         }
+        try:
+            self._config_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self._config_path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(payload, indent=2))
+            temp_path.replace(self._config_path)
+        except Exception:
+            return False
+        return True
+
+    def load_favorite_buckets(self) -> set[str]:
+        payload = self._read_app_config()
+        values = payload.get("favorite_buckets")
+        if not isinstance(values, list):
+            return set()
+        favorites: set[str] = set()
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            normalized = value.strip()
+            if not normalized:
+                continue
+            favorites.add(normalized)
+        return favorites
+
+    def save_favorite_buckets(self, favorites: set[str]) -> bool:
+        payload = self._read_app_config()
+        values = sorted(
+            value.strip() for value in favorites if isinstance(value, str) and value.strip()
+        )
+        payload["favorite_buckets"] = values
         try:
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = self._config_path.with_suffix(".tmp")

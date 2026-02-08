@@ -161,17 +161,29 @@ class TestAppHelpers(unittest.TestCase):
         app._hide_empty_buckets = True
         self.assertEqual([bucket.name for bucket in app._visible_buckets()], ["good"])
 
+    def test_visible_buckets_respects_only_favorites_filter(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.buckets = [
+            BucketInfo(name="alpha", profile="dev", access=BUCKET_ACCESS_GOOD),
+            BucketInfo(name="beta", profile="dev", access=BUCKET_ACCESS_GOOD),
+        ]
+        app._favorite_buckets = {"beta"}
+        app._show_only_favorite_buckets = True
+        self.assertEqual([bucket.name for bucket in app._visible_buckets()], ["beta"])
+
     def test_bucket_filter_state_payload(self) -> None:
         app = S3Browser(profiles=["default"])
         app._hide_no_view_buckets = True
         app._hide_no_download_buckets = False
         app._hide_empty_buckets = True
+        app._show_only_favorite_buckets = True
         self.assertEqual(
             app._bucket_filter_state_payload(),
             {
                 "hide_no_view": True,
                 "hide_no_download": False,
                 "hide_empty": True,
+                "only_favorites": True,
             },
         )
 

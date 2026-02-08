@@ -56,6 +56,23 @@ class TestTuiMount(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("escape")
                 exit_mock.assert_not_called()
 
+    async def test_slash_focuses_path_input(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.service = _StubService()
+        async with app.run_test() as pilot:
+            app.set_focus(app.s3_tree)
+            await pilot.press("/")
+            self.assertIs(app.focused, app.path_input)
+            self.assertEqual(app.path_input.value, "/")
+
+    async def test_non_slash_key_does_not_focus_path_input(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.service = _StubService()
+        async with app.run_test() as pilot:
+            app.set_focus(app.s3_tree)
+            await pilot.press("a")
+            self.assertIs(app.focused, app.s3_tree)
+
 
 if __name__ == "__main__":
     unittest.main()

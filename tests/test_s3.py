@@ -185,9 +185,24 @@ class TestS3Service(unittest.TestCase):
                 "hide_no_view": True,
                 "hide_no_download": False,
                 "hide_empty": True,
+                "only_favorites": True,
             }
             self.assertTrue(service.save_bucket_filter_state(expected))
             self.assertEqual(service.load_bucket_filter_state(), expected)
+
+    def test_favorite_buckets_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "bucket-cache.json"
+            config_path = Path(temp_dir) / "config.json"
+            service = S3Service(
+                profiles=[None, "dev"],
+                cache_path=cache_path,
+                cache_ttl_seconds=3600,
+            )
+            service._config_path = config_path
+            expected = {"beta", "alpha"}
+            self.assertTrue(service.save_favorite_buckets(expected))
+            self.assertEqual(service.load_favorite_buckets(), expected)
 
     def test_probe_profile_access_reraises_sso_expired(self) -> None:
         class _ExpiredClient:

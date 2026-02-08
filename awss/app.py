@@ -749,33 +749,73 @@ class S3Browser(App):
 
     #bucket-filters {
         height: 3;
-        margin-bottom: 1;
-        padding: 0 1;
-        border: round $panel;
-        background: $surface;
-        color: $text;
-        content-align: left middle;
+        min-height: 3;
+        margin-top: 1;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: $text-muted;
+    }
+
+    #bucket-filter-label {
+        width: auto;
+        height: 1;
+        margin-right: 0;
+        color: $text-muted;
+        text-style: bold;
+    }
+
+    #bucket-filter-row {
+        width: 100%;
+        height: 1;
     }
 
     .bucket-filter {
         height: 1;
-        min-width: 10;
-        padding: 0 1;
+        width: auto;
+        min-width: 9;
+        margin-right: 1;
+        padding: 0;
         border: none;
-        background: $panel;
+        background: transparent;
         color: $text-muted;
+        content-align: left middle;
+    }
+
+    .bucket-filter.active {
+        text-style: bold;
     }
 
     #bucket-filter-no-view {
-        color: red;
+        color: #c97a7a;
+    }
+    #bucket-filter-no-view.active {
+        color: #ff9e9e;
     }
 
     #bucket-filter-no-download {
-        color: #ff8c00;
+        color: #d1a067;
+    }
+    #bucket-filter-no-download.active {
+        color: #ffc782;
     }
 
     #bucket-filter-empty {
-        color: #9fb3c8;
+        color: #83afc7;
+    }
+    #bucket-filter-empty.active {
+        color: #9ed4f2;
+    }
+
+    #bucket-filter-favorites {
+        color: #c9b072;
+    }
+    #bucket-filter-favorites.active {
+        color: #ffe08d;
+    }
+
+    #bucket-filter-favorites {
+        margin-right: 0;
     }
 
     #s3-tree {
@@ -925,6 +965,7 @@ class S3Browser(App):
         ("alt+left", "back", "Back"),
         ("alt+right", "forward", "Forward"),
         ("ctrl+l", "focus_path", "Path"),
+        ("ctrl+f", "toggle_favorite", "Favorite"),
         ("space", "preview", "Preview"),
         ("m", "preview_more", "More/Scan"),
     ]
@@ -980,6 +1021,8 @@ class S3Browser(App):
         self._hide_no_view_buckets = False
         self._hide_no_download_buckets = False
         self._hide_empty_buckets = False
+        self._show_only_favorite_buckets = False
+        self._favorite_buckets: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -992,15 +1035,34 @@ class S3Browser(App):
             yield Button("↓", id="download", compact=True)
         with Horizontal(id="body"):
             with Vertical(id="left-pane"):
-                with Horizontal(id="bucket-filters"):
-                    yield Button("", id="bucket-filter-no-view", classes="bucket-filter")
-                    yield Button(
-                        "",
-                        id="bucket-filter-no-download",
-                        classes="bucket-filter",
-                    )
-                    yield Button("", id="bucket-filter-empty", classes="bucket-filter")
                 yield S3Tree("", id="s3-tree")
+                with Vertical(id="bucket-filters"):
+                    yield Static("Filters:", id="bucket-filter-label")
+                    with Horizontal(id="bucket-filter-row"):
+                        yield Button(
+                            "",
+                            id="bucket-filter-no-view",
+                            classes="bucket-filter",
+                            compact=True,
+                        )
+                        yield Button(
+                            "",
+                            id="bucket-filter-no-download",
+                            classes="bucket-filter",
+                            compact=True,
+                        )
+                        yield Button(
+                            "",
+                            id="bucket-filter-empty",
+                            classes="bucket-filter",
+                            compact=True,
+                        )
+                        yield Button(
+                            "",
+                            id="bucket-filter-favorites",
+                            classes="bucket-filter",
+                            compact=True,
+                        )
             yield SplitHandle(
                 "vertical",
                 before_id="left-pane",
@@ -1048,8 +1110,10 @@ class S3Browser(App):
             "#bucket-filter-no-download", Button
         )
         self.bucket_filter_empty = self.query_one("#bucket-filter-empty", Button)
+        self.bucket_filter_favorites = self.query_one("#bucket-filter-favorites", Button)
         self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
         self._set_profile_indicator(None)
+        await self._load_favorite_buckets()
         await self._load_bucket_filter_state()
         self._update_bucket_filter_buttons()
         self._col_icon = self.s3_table.add_column("", width=2)
@@ -1254,6 +1318,8 @@ class S3Browser(App):
         profile_label = bucket.profile or "default"
         style = self._bucket_name_style(bucket.access)
         label = Text(bucket.name, style=style)
+        if self._is_bucket_favorite(bucket.name):
+            label.append(" ★", style="bold #ffd166")
         label.append(f" [{profile_label}]", style="dim")
         return label
 
@@ -1273,6 +1339,11 @@ class S3Browser(App):
             if info.name == bucket:
                 return info.access
         return BUCKET_ACCESS_UNKNOWN
+
+    def _is_bucket_favorite(self, bucket: Optional[str]) -> bool:
+        if not bucket:
+            return False
+        return bucket in self._favorite_buckets
 
     def _bucket_is_empty_for_name(self, bucket: Optional[str]) -> bool:
         if not bucket:
@@ -1303,7 +1374,35 @@ class S3Browser(App):
             "hide_no_view": self._hide_no_view_buckets,
             "hide_no_download": self._hide_no_download_buckets,
             "hide_empty": self._hide_empty_buckets,
+            "only_favorites": self._show_only_favorite_buckets,
         }
+
+    async def _load_favorite_buckets(self) -> None:
+        load_favorite_buckets = getattr(self.service, "load_favorite_buckets", None)
+        if not callable(load_favorite_buckets):
+            return
+        try:
+            favorites = await asyncio.to_thread(load_favorite_buckets)
+        except Exception:
+            return
+        if isinstance(favorites, set):
+            self._favorite_buckets = {name for name in favorites if isinstance(name, str)}
+            return
+        if isinstance(favorites, list):
+            self._favorite_buckets = {
+                str(name).strip()
+                for name in favorites
+                if isinstance(name, str) and name.strip()
+            }
+
+    async def _save_favorite_buckets(self) -> None:
+        save_favorite_buckets = getattr(self.service, "save_favorite_buckets", None)
+        if not callable(save_favorite_buckets):
+            return
+        try:
+            await asyncio.to_thread(save_favorite_buckets, self._favorite_buckets)
+        except Exception:
+            return
 
     async def _load_bucket_filter_state(self) -> None:
         load_bucket_filter_state = getattr(self.service, "load_bucket_filter_state", None)
@@ -1318,6 +1417,7 @@ class S3Browser(App):
         self._hide_no_view_buckets = bool(state.get("hide_no_view", False))
         self._hide_no_download_buckets = bool(state.get("hide_no_download", False))
         self._hide_empty_buckets = bool(state.get("hide_empty", False))
+        self._show_only_favorite_buckets = bool(state.get("only_favorites", False))
 
     async def _save_bucket_filter_state(self) -> None:
         save_bucket_filter_state = getattr(self.service, "save_bucket_filter_state", None)
@@ -1329,21 +1429,42 @@ class S3Browser(App):
         except Exception:
             return
 
-    def _bucket_filter_button_label(self, checked: bool, label: str) -> str:
-        marker = "x" if checked else " "
-        return escape(f"[{marker}] {label}")
+    def _bucket_filter_button_label(self, checked: bool, label: str) -> Text:
+        marker = "[x]" if checked else "[ ]"
+        return Text(f"{marker} {label}")
+
+    def _set_filter_button_state(self, button: Button, checked: bool) -> None:
+        if checked:
+            button.add_class("active")
+        else:
+            button.remove_class("active")
 
     def _update_bucket_filter_buttons(self) -> None:
         if not hasattr(self, "bucket_filter_no_view"):
             return
         self.bucket_filter_no_view.label = self._bucket_filter_button_label(
-            self._hide_no_view_buckets, "red"
+            self._hide_no_view_buckets, "NoView"
+        )
+        self._set_filter_button_state(
+            self.bucket_filter_no_view, self._hide_no_view_buckets
         )
         self.bucket_filter_no_download.label = self._bucket_filter_button_label(
-            self._hide_no_download_buckets, "orange"
+            self._hide_no_download_buckets, "NoDL"
+        )
+        self._set_filter_button_state(
+            self.bucket_filter_no_download, self._hide_no_download_buckets
         )
         self.bucket_filter_empty.label = self._bucket_filter_button_label(
-            self._hide_empty_buckets, "empty"
+            self._hide_empty_buckets, "Empty"
+        )
+        self._set_filter_button_state(
+            self.bucket_filter_empty, self._hide_empty_buckets
+        )
+        self.bucket_filter_favorites.label = self._bucket_filter_button_label(
+            self._show_only_favorite_buckets, "Favs"
+        )
+        self._set_filter_button_state(
+            self.bucket_filter_favorites, self._show_only_favorite_buckets
         )
 
     def _bucket_hidden_by_filter(self, bucket: BucketInfo) -> bool:
@@ -1355,6 +1476,8 @@ class S3Browser(App):
         ):
             return True
         if self._hide_empty_buckets and bucket.is_empty:
+            return True
+        if self._show_only_favorite_buckets and not self._is_bucket_favorite(bucket.name):
             return True
         return False
 
@@ -1368,13 +1491,56 @@ class S3Browser(App):
             self._hide_no_download_buckets = not self._hide_no_download_buckets
         elif filter_name == "hide_empty":
             self._hide_empty_buckets = not self._hide_empty_buckets
+        elif filter_name == "only_favorites":
+            self._show_only_favorite_buckets = not self._show_only_favorite_buckets
         else:
             return
         self._update_bucket_filter_buttons()
         await self._save_bucket_filter_state()
+        self._refresh_after_bucket_visibility_change()
+
+    def _selected_bucket_for_toggle(self) -> Optional[str]:
+        if self.current_context and self.current_context.bucket:
+            return self.current_context.bucket
+        node = getattr(self.s3_tree, "cursor_node", None)
+        data = getattr(node, "data", None)
+        if isinstance(data, NodeInfo):
+            return data.bucket
+        info = self._row_info_for_cursor()
+        if info and info.kind == "bucket" and info.bucket:
+            return info.bucket
+        return None
+
+    def action_toggle_favorite(self) -> None:
+        self.run_worker(self._toggle_favorite_flow(), exclusive=True)
+
+    async def _toggle_favorite_flow(self) -> None:
+        bucket = self._selected_bucket_for_toggle()
+        if not bucket:
+            self.notify("Select a bucket to favorite.", severity="warning")
+            return
+        if bucket in self._favorite_buckets:
+            self._favorite_buckets.remove(bucket)
+            message = f"Removed favorite: {bucket}"
+        else:
+            self._favorite_buckets.add(bucket)
+            message = f"Favorited: {bucket}"
+        await self._save_favorite_buckets()
+        self._refresh_after_bucket_visibility_change()
+        self.notify(message, severity="information")
+
+    def _refresh_after_bucket_visibility_change(self) -> None:
+        current = self.current_context
+        visible_names = {bucket.name for bucket in self._visible_buckets()}
         self._render_bucket_nodes(self.buckets)
-        if not self.current_context:
-            self.show_bucket_list()
+        if current and current.bucket in visible_names:
+            profile = self._profile_for_bucket(current.bucket)
+            if profile is None:
+                profile = current.profile
+            self.navigate_to(profile, current.bucket, current.prefix)
+            return
+        self.current_context = None
+        self.show_bucket_list()
 
     def _bucket_access_level(self, access: str) -> int:
         if access == BUCKET_ACCESS_GOOD:
@@ -1635,6 +1801,9 @@ class S3Browser(App):
             return
         if event.button.id == "bucket-filter-empty":
             await self._toggle_bucket_filter("hide_empty")
+            return
+        if event.button.id == "bucket-filter-favorites":
+            await self._toggle_bucket_filter("only_favorites")
             return
         if event.button.id == "path-profile":
             self.action_choose_profile()
@@ -2481,9 +2650,12 @@ class S3Browser(App):
         suppress_history = self._consume_history_suppression()
         rows: list[tuple[str, str, str, str, RowInfo]] = []
         for bucket in self._visible_buckets():
+            display_name = bucket.name
+            if self._is_bucket_favorite(bucket.name):
+                display_name = f"{display_name} ★"
             rows.append(
                 (
-                    bucket.name,
+                    display_name,
                     "dir",
                     "",
                     "",
@@ -3094,14 +3266,10 @@ class S3Browser(App):
             self._quit_escape_deadline = 0.0
         if self.path_input.has_focus:
             return
-        if not event.is_printable or not event.character:
-            return
-        if event.key == "space" or event.character == " ":
-            return
-        if event.key in {"q", "r", "m"}:
+        if event.key != "slash" and event.character != "/":
             return
         self.set_focus(self.path_input)
-        self.path_input.insert_text_at_cursor(event.character)
+        self.path_input.insert_text_at_cursor("/")
         event.stop()
 
     def _parse_s3_path(self, value: str) -> tuple[str, str]:
