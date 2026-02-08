@@ -439,8 +439,7 @@ class ProfileSelectDialog(ModalScreen[Optional[str]]):
     CSS = """
     ProfileSelectDialog {
         align: right top;
-        background: transparent;
-        padding: 3 2 0 0;
+        background: $background 0%;
     }
 
     #profile-dialog {
@@ -448,6 +447,7 @@ class ProfileSelectDialog(ModalScreen[Optional[str]]):
         max-width: 40;
         min-width: 18;
         height: auto;
+        margin: 2 1 0 0;
         padding: 1;
         border: round $panel;
         background: $panel;
@@ -1009,6 +1009,9 @@ class S3Browser(App):
         self.set_focus(self.s3_tree)
         self._sync_nav_buttons()
         self._resize_table_columns()
+        self.run_worker(self._startup_refresh_flow(), exclusive=True)
+
+    async def _startup_refresh_flow(self) -> None:
         await self._ensure_sso_logins()
         await self.refresh_buckets()
 
@@ -1302,8 +1305,8 @@ class S3Browser(App):
 
         return best_profile, best_access
 
-    async def action_refresh(self) -> None:
-        await self.refresh_buckets()
+    def action_refresh(self) -> None:
+        self.run_worker(self.refresh_buckets(), exclusive=True)
 
     def action_confirm_quit(self) -> None:
         now = monotonic()
@@ -1711,8 +1714,7 @@ class S3Browser(App):
             "Refreshing Buckets",
             "Listing buckets across configured profiles...",
         )
-        self.push_screen(overlay)
-        await asyncio.sleep(0)
+        await self.push_screen(overlay)
         self.s3_tree.clear()
         self.bucket_nodes.clear()
         self.bucket_profile_candidates.clear()
