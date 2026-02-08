@@ -29,6 +29,7 @@ class BucketInfo:
     name: str
     profile: Optional[str]
     access: str = BUCKET_ACCESS_UNKNOWN
+    is_empty: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class S3Service:
         self.profiles = self._normalize_profiles(profiles)
         self._region = region
         self._clients: dict[str, object] = {}
+        self._config_path = self._default_config_path()
         self._bucket_cache_path = cache_path or self._default_bucket_cache_path()
         self._bucket_cache_ttl_seconds = max(0, int(cache_ttl_seconds))
 
@@ -95,13 +97,19 @@ class S3Service:
         ]
         return any(marker in text for marker in markers)
 
-    def _default_bucket_cache_path(self) -> Path:
+    def _config_base_dir(self) -> Path:
         config_home = os.environ.get("XDG_CONFIG_HOME")
         if config_home:
             base = Path(config_home).expanduser()
         else:
             base = Path.home() / ".config"
-        return base / "awss" / "bucket-cache.json"
+        return base / "awss"
+
+    def _default_bucket_cache_path(self) -> Path:
+        return self._config_base_dir() / "bucket-cache.json"
+
+    def _default_config_path(self) -> Path:
+        return self._config_base_dir() / "config.json"
 
     def _client(self, profile: Optional[str]):
         key = self._profile_key(profile)
@@ -272,6 +280,27 @@ class S3Service:
         )
         return self._normalize_bucket_access(access)
 
+    async def is_bucket_empty(self, profile: Optional[str], bucket: str) -> bool:
+        return await asyncio.to_thread(self._is_bucket_empty, profile, bucket)
+
+    def _is_bucket_empty(self, profile: Optional[str], bucket: str) -> bool:
+        client = self._client(profile)
+        try:
+            response = client.list_objects_v2(Bucket=bucket, MaxKeys=1)
+        except Exception as exc:
+            if self._is_sso_expired_error(exc):
+                raise
+            return False
+        if not isinstance(response, dict):
+            return False
+        contents = response.get("Contents", [])
+        if isinstance(contents, list) and contents:
+            return False
+        key_count = response.get("KeyCount")
+        if isinstance(key_count, int):
+            return key_count == 0
+        return True
+
     def _load_full_config(self) -> dict:
         session = botocore.session.get_session()
         try:
@@ -368,6 +397,9 @@ class S3Service:
     def _decode_access(self, value: object) -> str:
         return self._normalize_bucket_access(value)
 
+    def _decode_is_empty(self, value: object) -> bool:
+        return bool(value)
+
     def _read_bucket_cache(self) -> tuple[Optional[datetime], list[BucketInfo]]:
         try:
             payload = json.loads(self._bucket_cache_path.read_text())
@@ -390,7 +422,15 @@ class S3Service:
                 continue
             profile = self._decode_profile(item.get("profile"))
             access = self._decode_access(item.get("access"))
-            buckets.append(BucketInfo(name=stripped, profile=profile, access=access))
+            is_empty = self._decode_is_empty(item.get("is_empty"))
+            buckets.append(
+                BucketInfo(
+                    name=stripped,
+                    profile=profile,
+                    access=access,
+                    is_empty=is_empty,
+                )
+            )
         saved_at = self._parse_cache_saved_at(payload.get("saved_at"))
         return saved_at, buckets
 
@@ -423,6 +463,7 @@ class S3Service:
                 "name": name,
                 "profile": info.profile,
                 "access": self._normalize_bucket_access(info.access),
+                "is_empty": bool(info.is_empty),
             }
             for name, info in sorted(latest_by_name.items(), key=lambda item: item[0])
         ]
@@ -435,6 +476,49 @@ class S3Service:
             temp_path = self._bucket_cache_path.with_suffix(".tmp")
             temp_path.write_text(json.dumps(payload, indent=2))
             temp_path.replace(self._bucket_cache_path)
+        except Exception:
+            return False
+        return True
+
+    def _read_app_config(self) -> dict[str, object]:
+        try:
+            payload = json.loads(self._config_path.read_text())
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return payload
+
+    def load_bucket_filter_state(self) -> dict[str, bool]:
+        defaults = {
+            "hide_no_view": False,
+            "hide_no_download": False,
+            "hide_empty": False,
+        }
+        payload = self._read_app_config()
+        section = payload.get("bucket_filters")
+        if not isinstance(section, dict):
+            return defaults
+        return {
+            "hide_no_view": bool(section.get("hide_no_view", defaults["hide_no_view"])),
+            "hide_no_download": bool(
+                section.get("hide_no_download", defaults["hide_no_download"])
+            ),
+            "hide_empty": bool(section.get("hide_empty", defaults["hide_empty"])),
+        }
+
+    def save_bucket_filter_state(self, state: dict[str, bool]) -> bool:
+        payload = self._read_app_config()
+        payload["bucket_filters"] = {
+            "hide_no_view": bool(state.get("hide_no_view", False)),
+            "hide_no_download": bool(state.get("hide_no_download", False)),
+            "hide_empty": bool(state.get("hide_empty", False)),
+        }
+        try:
+            self._config_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self._config_path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(payload, indent=2))
+            temp_path.replace(self._config_path)
         except Exception:
             return False
         return True

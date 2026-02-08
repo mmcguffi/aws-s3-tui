@@ -139,6 +139,42 @@ class TestAppHelpers(unittest.TestCase):
         self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_NO_DOWNLOAD), "bold #ff8c00")
         self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_GOOD), "bold #2f80ed")
 
+    def test_visible_buckets_respects_filter_state(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.buckets = [
+            BucketInfo(name="red", profile="dev", access=BUCKET_ACCESS_NO_VIEW),
+            BucketInfo(
+                name="orange",
+                profile="dev",
+                access=BUCKET_ACCESS_NO_DOWNLOAD,
+            ),
+            BucketInfo(
+                name="empty",
+                profile="dev",
+                access=BUCKET_ACCESS_GOOD,
+                is_empty=True,
+            ),
+            BucketInfo(name="good", profile="dev", access=BUCKET_ACCESS_GOOD),
+        ]
+        app._hide_no_view_buckets = True
+        app._hide_no_download_buckets = True
+        app._hide_empty_buckets = True
+        self.assertEqual([bucket.name for bucket in app._visible_buckets()], ["good"])
+
+    def test_bucket_filter_state_payload(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app._hide_no_view_buckets = True
+        app._hide_no_download_buckets = False
+        app._hide_empty_buckets = True
+        self.assertEqual(
+            app._bucket_filter_state_payload(),
+            {
+                "hide_no_view": True,
+                "hide_no_download": False,
+                "hide_empty": True,
+            },
+        )
+
     def test_call_with_sso_retry_reauthenticates_and_retries(self) -> None:
         app = S3Browser(profiles=["default"])
         app.notify = lambda *args, **kwargs: None  # type: ignore[assignment]

@@ -120,10 +120,33 @@ class TestS3Service(unittest.TestCase):
             )
             expected = [
                 BucketInfo(name="alpha", profile=None, access=BUCKET_ACCESS_NO_VIEW),
-                BucketInfo(name="beta", profile="dev", access=BUCKET_ACCESS_GOOD),
+                BucketInfo(
+                    name="beta",
+                    profile="dev",
+                    access=BUCKET_ACCESS_GOOD,
+                    is_empty=True,
+                ),
             ]
             self.assertTrue(service.save_bucket_cache(expected))
             self.assertEqual(service.load_bucket_cache(), expected)
+
+    def test_bucket_filter_state_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "bucket-cache.json"
+            config_path = Path(temp_dir) / "config.json"
+            service = S3Service(
+                profiles=[None, "dev"],
+                cache_path=cache_path,
+                cache_ttl_seconds=3600,
+            )
+            service._config_path = config_path
+            expected = {
+                "hide_no_view": True,
+                "hide_no_download": False,
+                "hide_empty": True,
+            }
+            self.assertTrue(service.save_bucket_filter_state(expected))
+            self.assertEqual(service.load_bucket_filter_state(), expected)
 
     def test_probe_profile_access_reraises_sso_expired(self) -> None:
         class _ExpiredClient:
@@ -149,6 +172,26 @@ class TestS3Service(unittest.TestCase):
 
         access = service._probe_profile_access_for_bucket("bucket-a", None)
         self.assertEqual(access, BUCKET_ACCESS_NO_VIEW)
+
+    def test_is_bucket_empty_true_when_key_count_zero(self) -> None:
+        class _EmptyClient:
+            def list_objects_v2(self, **_kwargs):
+                return {"KeyCount": 0, "Contents": []}
+
+        service = S3Service(profiles=[None])
+        service._clients[service._profile_key(None)] = _EmptyClient()
+
+        self.assertTrue(service._is_bucket_empty(None, "bucket-a"))
+
+    def test_is_bucket_empty_false_with_contents(self) -> None:
+        class _NonEmptyClient:
+            def list_objects_v2(self, **_kwargs):
+                return {"KeyCount": 1, "Contents": [{"Key": "file.txt"}]}
+
+        service = S3Service(profiles=[None])
+        service._clients[service._profile_key(None)] = _NonEmptyClient()
+
+        self.assertFalse(service._is_bucket_empty(None, "bucket-a"))
 
 
 if __name__ == "__main__":

@@ -740,9 +740,47 @@ class S3Browser(App):
         overflow-y: hidden;
     }
 
-    #s3-tree {
+    #left-pane {
         width: 35%;
         min-width: 24;
+        height: 1fr;
+        overflow-y: hidden;
+    }
+
+    #bucket-filters {
+        height: 3;
+        margin-bottom: 1;
+        padding: 0 1;
+        border: round $panel;
+        background: $surface;
+        color: $text;
+        content-align: left middle;
+    }
+
+    .bucket-filter {
+        height: 1;
+        min-width: 10;
+        padding: 0 1;
+        border: none;
+        background: $panel;
+        color: $text-muted;
+    }
+
+    #bucket-filter-no-view {
+        color: red;
+    }
+
+    #bucket-filter-no-download {
+        color: #ff8c00;
+    }
+
+    #bucket-filter-empty {
+        color: #9fb3c8;
+    }
+
+    #s3-tree {
+        width: 1fr;
+        height: 1fr;
         border: round $panel;
     }
 
@@ -939,6 +977,9 @@ class S3Browser(App):
         self._col_modified = None
         self._quit_escape_deadline = 0.0
         self._sso_reauth_inflight: dict[str, asyncio.Task[bool]] = {}
+        self._hide_no_view_buckets = False
+        self._hide_no_download_buckets = False
+        self._hide_empty_buckets = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -950,10 +991,19 @@ class S3Browser(App):
             yield Button("→", id="nav-forward", compact=True)
             yield Button("↓", id="download", compact=True)
         with Horizontal(id="body"):
-            yield S3Tree("", id="s3-tree")
+            with Vertical(id="left-pane"):
+                with Horizontal(id="bucket-filters"):
+                    yield Button("", id="bucket-filter-no-view", classes="bucket-filter")
+                    yield Button(
+                        "",
+                        id="bucket-filter-no-download",
+                        classes="bucket-filter",
+                    )
+                    yield Button("", id="bucket-filter-empty", classes="bucket-filter")
+                yield S3Tree("", id="s3-tree")
             yield SplitHandle(
                 "vertical",
-                before_id="s3-tree",
+                before_id="left-pane",
                 after_id="right-pane",
                 classes="split-vertical",
             )
@@ -993,8 +1043,15 @@ class S3Browser(App):
         self.preview = self.query_one("#preview-content", TextArea)
         self.preview_status = self.query_one("#preview-status", Static)
         self.preview_more = self.query_one("#preview-more", Button)
+        self.bucket_filter_no_view = self.query_one("#bucket-filter-no-view", Button)
+        self.bucket_filter_no_download = self.query_one(
+            "#bucket-filter-no-download", Button
+        )
+        self.bucket_filter_empty = self.query_one("#bucket-filter-empty", Button)
         self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
         self._set_profile_indicator(None)
+        await self._load_bucket_filter_state()
+        self._update_bucket_filter_buttons()
         self._col_icon = self.s3_table.add_column("", width=2)
         (
             self._col_name,
@@ -1217,6 +1274,14 @@ class S3Browser(App):
                 return info.access
         return BUCKET_ACCESS_UNKNOWN
 
+    def _bucket_is_empty_for_name(self, bucket: Optional[str]) -> bool:
+        if not bucket:
+            return False
+        for info in self.buckets:
+            if info.name == bucket:
+                return bool(info.is_empty)
+        return False
+
     def _set_profile_indicator(
         self, profile: Optional[str], bucket: Optional[str] = None
     ) -> None:
@@ -1232,6 +1297,84 @@ class S3Browser(App):
         self.path_profile.disabled = False
         self.path_profile.label = escape(f"[{profile or 'default'}]")
         self.path_profile.styles.color = profile_style
+
+    def _bucket_filter_state_payload(self) -> dict[str, bool]:
+        return {
+            "hide_no_view": self._hide_no_view_buckets,
+            "hide_no_download": self._hide_no_download_buckets,
+            "hide_empty": self._hide_empty_buckets,
+        }
+
+    async def _load_bucket_filter_state(self) -> None:
+        load_bucket_filter_state = getattr(self.service, "load_bucket_filter_state", None)
+        if not callable(load_bucket_filter_state):
+            return
+        try:
+            state = await asyncio.to_thread(load_bucket_filter_state)
+        except Exception:
+            return
+        if not isinstance(state, dict):
+            return
+        self._hide_no_view_buckets = bool(state.get("hide_no_view", False))
+        self._hide_no_download_buckets = bool(state.get("hide_no_download", False))
+        self._hide_empty_buckets = bool(state.get("hide_empty", False))
+
+    async def _save_bucket_filter_state(self) -> None:
+        save_bucket_filter_state = getattr(self.service, "save_bucket_filter_state", None)
+        if not callable(save_bucket_filter_state):
+            return
+        state = self._bucket_filter_state_payload()
+        try:
+            await asyncio.to_thread(save_bucket_filter_state, state)
+        except Exception:
+            return
+
+    def _bucket_filter_button_label(self, checked: bool, label: str) -> str:
+        marker = "x" if checked else " "
+        return escape(f"[{marker}] {label}")
+
+    def _update_bucket_filter_buttons(self) -> None:
+        if not hasattr(self, "bucket_filter_no_view"):
+            return
+        self.bucket_filter_no_view.label = self._bucket_filter_button_label(
+            self._hide_no_view_buckets, "red"
+        )
+        self.bucket_filter_no_download.label = self._bucket_filter_button_label(
+            self._hide_no_download_buckets, "orange"
+        )
+        self.bucket_filter_empty.label = self._bucket_filter_button_label(
+            self._hide_empty_buckets, "empty"
+        )
+
+    def _bucket_hidden_by_filter(self, bucket: BucketInfo) -> bool:
+        if self._hide_no_view_buckets and bucket.access == BUCKET_ACCESS_NO_VIEW:
+            return True
+        if (
+            self._hide_no_download_buckets
+            and bucket.access == BUCKET_ACCESS_NO_DOWNLOAD
+        ):
+            return True
+        if self._hide_empty_buckets and bucket.is_empty:
+            return True
+        return False
+
+    def _visible_buckets(self) -> list[BucketInfo]:
+        return [bucket for bucket in self.buckets if not self._bucket_hidden_by_filter(bucket)]
+
+    async def _toggle_bucket_filter(self, filter_name: str) -> None:
+        if filter_name == "hide_no_view":
+            self._hide_no_view_buckets = not self._hide_no_view_buckets
+        elif filter_name == "hide_no_download":
+            self._hide_no_download_buckets = not self._hide_no_download_buckets
+        elif filter_name == "hide_empty":
+            self._hide_empty_buckets = not self._hide_empty_buckets
+        else:
+            return
+        self._update_bucket_filter_buttons()
+        await self._save_bucket_filter_state()
+        self._render_bucket_nodes(self.buckets)
+        if not self.current_context:
+            self.show_bucket_list()
 
     def _bucket_access_level(self, access: str) -> int:
         if access == BUCKET_ACCESS_GOOD:
@@ -1484,6 +1627,15 @@ class S3Browser(App):
         if event.button.id == "preview-more":
             await self.action_preview_more()
             return
+        if event.button.id == "bucket-filter-no-view":
+            await self._toggle_bucket_filter("hide_no_view")
+            return
+        if event.button.id == "bucket-filter-no-download":
+            await self._toggle_bucket_filter("hide_no_download")
+            return
+        if event.button.id == "bucket-filter-empty":
+            await self._toggle_bucket_filter("hide_empty")
+            return
         if event.button.id == "path-profile":
             self.action_choose_profile()
             return
@@ -1570,7 +1722,12 @@ class S3Browser(App):
             for info in self.buckets:
                 if info.name == bucket:
                     updated.append(
-                        BucketInfo(name=info.name, profile=profile, access=access)
+                        BucketInfo(
+                            name=info.name,
+                            profile=profile,
+                            access=access,
+                            is_empty=info.is_empty,
+                        )
                     )
                 else:
                     updated.append(info)
@@ -1687,6 +1844,41 @@ class S3Browser(App):
                 values.append(bucket.profile)
         return candidates
 
+    async def _resolve_bucket_empty_flags(
+        self, buckets: list[BucketInfo]
+    ) -> list[BucketInfo]:
+        is_bucket_empty = getattr(self.service, "is_bucket_empty", None)
+        if not callable(is_bucket_empty):
+            return buckets
+        tasks = []
+        indices: list[int] = []
+        for index, bucket in enumerate(buckets):
+            if bucket.access == BUCKET_ACCESS_NO_VIEW:
+                continue
+            indices.append(index)
+            tasks.append(
+                self._call_with_sso_retry(
+                    bucket.profile,
+                    is_bucket_empty,
+                    bucket.profile,
+                    bucket.name,
+                )
+            )
+        if not tasks:
+            return buckets
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        resolved = list(buckets)
+        for index, result in zip(indices, results):
+            bucket = resolved[index]
+            is_empty = result if isinstance(result, bool) else False
+            resolved[index] = BucketInfo(
+                name=bucket.name,
+                profile=bucket.profile,
+                access=bucket.access,
+                is_empty=is_empty,
+            )
+        return resolved
+
     def _render_bucket_nodes(self, buckets: list[BucketInfo]) -> None:
         self.s3_tree.clear()
         self.bucket_nodes.clear()
@@ -1697,7 +1889,7 @@ class S3Browser(App):
             values = self.bucket_profile_candidates.setdefault(bucket.name, [])
             if bucket.profile not in values:
                 values.append(bucket.profile)
-        for bucket in self.buckets:
+        for bucket in self._visible_buckets():
             node = self.s3_tree.root.add(
                 self._bucket_label(bucket),
                 data=NodeInfo(profile=bucket.profile, bucket=bucket.name, prefix=""),
@@ -1782,6 +1974,10 @@ class S3Browser(App):
             buckets = await self.service.select_best_bucket_profiles(buckets)
             if token != self._load_token:
                 return
+            overlay.update_detail("Checking which buckets are empty...")
+            buckets = await self._resolve_bucket_empty_flags(buckets)
+            if token != self._load_token:
+                return
 
             if buckets:
                 save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
@@ -1861,6 +2057,7 @@ class S3Browser(App):
     ) -> None:
         existing_access = self._bucket_access_for_name(bucket)
         chosen_access = new_access or existing_access
+        existing_is_empty = self._bucket_is_empty_for_name(bucket)
         if old_profile == new_profile:
             bucket_node = self.bucket_nodes.get((new_profile, bucket))
             if bucket_node is not None:
@@ -1872,7 +2069,12 @@ class S3Browser(App):
                     pass
                 try:
                     label = self._bucket_label(
-                        BucketInfo(name=bucket, profile=new_profile, access=chosen_access)
+                        BucketInfo(
+                            name=bucket,
+                            profile=new_profile,
+                            access=chosen_access,
+                            is_empty=existing_is_empty,
+                        )
                     )
                     bucket_node.set_label(label)
                 except Exception:
@@ -1885,6 +2087,7 @@ class S3Browser(App):
                             name=info.name,
                             profile=info.profile,
                             access=chosen_access,
+                            is_empty=info.is_empty,
                         )
                     )
                 else:
@@ -1912,7 +2115,12 @@ class S3Browser(App):
                 pass
             try:
                 label = self._bucket_label(
-                    BucketInfo(name=bucket, profile=new_profile, access=chosen_access)
+                    BucketInfo(
+                        name=bucket,
+                        profile=new_profile,
+                        access=chosen_access,
+                        is_empty=existing_is_empty,
+                    )
                 )
                 bucket_node.set_label(label)
             except Exception:
@@ -1942,6 +2150,7 @@ class S3Browser(App):
                         name=info.name,
                         profile=new_profile,
                         access=chosen_access,
+                        is_empty=info.is_empty,
                     )
                 )
             else:
@@ -2232,7 +2441,7 @@ class S3Browser(App):
         self._preview_token += 1
         suppress_history = self._consume_history_suppression()
         rows: list[tuple[str, str, str, str, RowInfo]] = []
-        for bucket in self.buckets:
+        for bucket in self._visible_buckets():
             rows.append(
                 (
                     bucket.name,
