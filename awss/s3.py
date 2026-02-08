@@ -79,6 +79,22 @@ class S3Service:
     def _profile_label(self, profile: Optional[str]) -> str:
         return profile or "default"
 
+    def _is_sso_expired_error(self, exc: Exception) -> bool:
+        text = f"{type(exc).__name__}: {exc}".lower()
+        markers = [
+            "unauthorizedssotokenerror",
+            "sso session",
+            "sso token",
+            "token has expired",
+            "token is expired",
+            "expiredtoken",
+            "the sso session associated with this profile has expired",
+            "error loading sso token",
+            "run aws sso login",
+            "aws sso login",
+        ]
+        return any(marker in text for marker in markers)
+
     def _default_bucket_cache_path(self) -> Path:
         config_home = os.environ.get("XDG_CONFIG_HOME")
         if config_home:
@@ -209,7 +225,9 @@ class S3Service:
         client = self._client(profile)
         try:
             response = client.list_objects_v2(Bucket=bucket, MaxKeys=10)
-        except Exception:
+        except Exception as exc:
+            if self._is_sso_expired_error(exc):
+                raise
             return BUCKET_ACCESS_NO_VIEW
         contents = response.get("Contents", []) if isinstance(response, dict) else []
         keys: list[str] = []
@@ -230,7 +248,9 @@ class S3Service:
                     Key=key,
                     Range="bytes=0-0",
                 )
-            except Exception:
+            except Exception as exc:
+                if self._is_sso_expired_error(exc):
+                    raise
                 continue
             body = response.get("Body") if isinstance(response, dict) else None
             if body is not None:

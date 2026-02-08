@@ -1,5 +1,7 @@
+import asyncio
 import argparse
 import unittest
+from unittest.mock import AsyncMock
 
 from awss.app import (
     NodeInfo,
@@ -136,6 +138,48 @@ class TestAppHelpers(unittest.TestCase):
         self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_NO_VIEW), "bold red")
         self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_NO_DOWNLOAD), "bold #ff8c00")
         self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_GOOD), "bold #2f80ed")
+
+    def test_call_with_sso_retry_reauthenticates_and_retries(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.notify = lambda *args, **kwargs: None  # type: ignore[assignment]
+        app._run_sso_login = AsyncMock(return_value=True)
+        calls = {"count": 0}
+
+        async def operation(*_args, **_kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise Exception(
+                    "UnauthorizedSSOTokenError: The SSO session associated with "
+                    "this profile has expired or is otherwise invalid."
+                )
+            return "ok"
+
+        result = asyncio.run(app._call_with_sso_retry("dev", operation))
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls["count"], 2)
+        app._run_sso_login.assert_awaited_once_with("dev")
+
+    def test_reauth_sso_profile_deduplicates_inflight_login(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.notify = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+        async def fake_login(_profile: str) -> bool:
+            await asyncio.sleep(0.01)
+            return True
+
+        app._run_sso_login = AsyncMock(side_effect=fake_login)
+
+        async def run_two():
+            return await asyncio.gather(
+                app._reauth_sso_profile("dev"),
+                app._reauth_sso_profile("dev"),
+            )
+
+        results = asyncio.run(run_two())
+
+        self.assertEqual(results, [True, True])
+        app._run_sso_login.assert_awaited_once_with("dev")
 
 
 if __name__ == "__main__":

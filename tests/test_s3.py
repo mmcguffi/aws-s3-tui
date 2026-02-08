@@ -125,6 +125,31 @@ class TestS3Service(unittest.TestCase):
             self.assertTrue(service.save_bucket_cache(expected))
             self.assertEqual(service.load_bucket_cache(), expected)
 
+    def test_probe_profile_access_reraises_sso_expired(self) -> None:
+        class _ExpiredClient:
+            def list_objects_v2(self, **_kwargs):
+                raise Exception(
+                    "UnauthorizedSSOTokenError: The SSO session associated with "
+                    "this profile has expired or is otherwise invalid."
+                )
+
+        service = S3Service(profiles=[None])
+        service._clients[service._profile_key(None)] = _ExpiredClient()
+
+        with self.assertRaises(Exception):
+            service._probe_profile_access_for_bucket("bucket-a", None)
+
+    def test_probe_profile_access_returns_no_view_for_non_sso_errors(self) -> None:
+        class _DeniedClient:
+            def list_objects_v2(self, **_kwargs):
+                raise Exception("AccessDenied: forbidden")
+
+        service = S3Service(profiles=[None])
+        service._clients[service._profile_key(None)] = _DeniedClient()
+
+        access = service._probe_profile_access_for_bucket("bucket-a", None)
+        self.assertEqual(access, BUCKET_ACCESS_NO_VIEW)
+
 
 if __name__ == "__main__":
     unittest.main()

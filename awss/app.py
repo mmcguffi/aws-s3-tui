@@ -937,6 +937,7 @@ class S3Browser(App):
         self._col_size = None
         self._col_modified = None
         self._quit_escape_deadline = 0.0
+        self._sso_reauth_inflight: dict[str, asyncio.Task[bool]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1025,7 +1026,7 @@ class S3Browser(App):
             )
             await self._run_sso_login(profile)
 
-    async def _run_sso_login(self, profile: str) -> None:
+    async def _run_sso_login(self, profile: str) -> bool:
         try:
             process = await asyncio.create_subprocess_exec(
                 "aws",
@@ -1040,16 +1041,82 @@ class S3Browser(App):
             self.notify(
                 "AWS CLI not found; cannot run `aws sso login`.", severity="error"
             )
-            return
+            return False
         stdout, stderr = await process.communicate()
         if process.returncode == 0:
-            return
+            return True
         message = stderr.decode("utf-8", errors="replace").strip()
         if not message:
             message = stdout.decode("utf-8", errors="replace").strip()
         if not message:
             message = f"aws sso login failed for profile '{profile}'."
         self.notify(message, severity="error")
+        return False
+
+    def _profile_label(self, profile: Optional[str]) -> str:
+        return profile or "default"
+
+    def _is_sso_expired_error(self, exc: Exception) -> bool:
+        if exc is None:
+            return False
+        text = f"{type(exc).__name__}: {exc}".lower()
+        markers = [
+            "unauthorizedssotokenerror",
+            "sso session",
+            "sso token",
+            "token has expired",
+            "token is expired",
+            "expiredtoken",
+            "the sso session associated with this profile has expired",
+            "error loading sso token",
+            "run aws sso login",
+            "aws sso login",
+        ]
+        return any(marker in text for marker in markers)
+
+    async def _reauth_sso_profile(self, profile: Optional[str]) -> bool:
+        profile_name = self._profile_label(profile)
+        inflight = self._sso_reauth_inflight.get(profile_name)
+        if inflight is None:
+
+            async def do_login() -> bool:
+                self.notify(
+                    f"SSO token expired for '{profile_name}'. Running aws sso login...",
+                    severity="warning",
+                )
+                ok = await self._run_sso_login(profile_name)
+                if ok:
+                    self.notify(
+                        f"SSO login refreshed for '{profile_name}'.",
+                        severity="information",
+                    )
+                return ok
+
+            inflight = asyncio.create_task(do_login())
+            self._sso_reauth_inflight[profile_name] = inflight
+        try:
+            return await inflight
+        finally:
+            active = self._sso_reauth_inflight.get(profile_name)
+            if active is inflight and inflight.done():
+                self._sso_reauth_inflight.pop(profile_name, None)
+
+    async def _call_with_sso_retry(
+        self,
+        profile: Optional[str],
+        operation,
+        *args,
+        **kwargs,
+    ):
+        try:
+            return await operation(*args, **kwargs)
+        except Exception as exc:
+            if not self._is_sso_expired_error(exc):
+                raise
+            relogged = await self._reauth_sso_profile(profile)
+            if not relogged:
+                raise
+            return await operation(*args, **kwargs)
 
     def on_resize(self, event: events.Resize) -> None:
         self._resize_table_columns()
@@ -1189,8 +1256,29 @@ class S3Browser(App):
                 profile: index for index, profile in enumerate(getattr(self.service, "profiles"))
             }
 
-        checks = [bucket_access(profile, bucket) for profile in candidates]
-        results = await asyncio.gather(*checks, return_exceptions=True)
+        async def probe_access(profile: Optional[str]) -> str:
+            try:
+                result = await self._call_with_sso_retry(
+                    profile,
+                    bucket_access,
+                    profile,
+                    bucket,
+                )
+            except Exception:
+                return BUCKET_ACCESS_NO_VIEW
+            if not isinstance(result, str):
+                return BUCKET_ACCESS_NO_VIEW
+            normalized = result.strip().lower()
+            if normalized in {
+                BUCKET_ACCESS_GOOD,
+                BUCKET_ACCESS_NO_DOWNLOAD,
+                BUCKET_ACCESS_NO_VIEW,
+            }:
+                return normalized
+            return BUCKET_ACCESS_NO_VIEW
+
+        checks = [probe_access(profile) for profile in candidates]
+        results = await asyncio.gather(*checks)
 
         best_profile = current_profile
         best_access = self._bucket_access_for_name(bucket)
@@ -1200,16 +1288,7 @@ class S3Browser(App):
             -profile_order.get(best_profile, len(profile_order)),
         )
 
-        for profile, result in zip(candidates, results):
-            access = BUCKET_ACCESS_NO_VIEW
-            if isinstance(result, str):
-                normalized = result.strip().lower()
-                if normalized in {
-                    BUCKET_ACCESS_GOOD,
-                    BUCKET_ACCESS_NO_DOWNLOAD,
-                    BUCKET_ACCESS_NO_VIEW,
-                }:
-                    access = normalized
+        for profile, access in zip(candidates, results):
             key = (
                 self._bucket_access_level(access),
                 1 if profile is not None else 0,
@@ -1288,8 +1367,13 @@ class S3Browser(App):
             try:
                 for info in selected:
                     destination = str(directory / (Path(info.key).name or "download"))
-                    await self.service.download_object(
-                        info.profile, info.bucket, info.key, destination
+                    await self._call_with_sso_retry(
+                        info.profile,
+                        self.service.download_object,
+                        info.profile,
+                        info.bucket,
+                        info.key,
+                        destination,
                     )
             except Exception as exc:
                 self.notify(f"{exc}", severity="error")
@@ -1308,8 +1392,13 @@ class S3Browser(App):
         destination = self._resolve_download_path(target, info)
         self.notify("Downloading...", severity="information")
         try:
-            await self.service.download_object(
-                info.profile, info.bucket, info.key, destination
+            await self._call_with_sso_retry(
+                info.profile,
+                self.service.download_object,
+                info.profile,
+                info.bucket,
+                info.key,
+                destination,
             )
         except Exception as exc:
             self.notify(f"{exc}", severity="error")
@@ -1334,8 +1423,12 @@ class S3Browser(App):
         target_dir = self._resolve_prefix_download_dir(target, info)
         self.notify("Listing files...", severity="information")
         try:
-            objects = await self.service.list_objects_recursive(
-                info.profile, info.bucket, info.prefix
+            objects = await self._call_with_sso_retry(
+                info.profile,
+                self.service.list_objects_recursive,
+                info.profile,
+                info.bucket,
+                info.prefix,
             )
         except Exception as exc:
             self.notify(f"{exc}", severity="error")
@@ -1356,8 +1449,13 @@ class S3Browser(App):
                 else:
                     relative = obj.key
                 destination = str(target_dir / relative)
-                await self.service.download_object(
-                    info.profile, info.bucket, obj.key, destination
+                await self._call_with_sso_retry(
+                    info.profile,
+                    self.service.download_object,
+                    info.profile,
+                    info.bucket,
+                    obj.key,
+                    destination,
                 )
         except Exception as exc:
             self.notify(f"{exc}", severity="error")
@@ -1434,7 +1532,12 @@ class S3Browser(App):
         bucket_access = getattr(self.service, "bucket_access", None)
         if callable(bucket_access):
             try:
-                access = await bucket_access(profile, bucket)
+                access = await self._call_with_sso_retry(
+                    profile,
+                    bucket_access,
+                    profile,
+                    bucket,
+                )
             except Exception:
                 access = BUCKET_ACCESS_NO_VIEW
 
@@ -1553,8 +1656,12 @@ class S3Browser(App):
             return
         info: NodeInfo = node.data
         try:
-            prefixes = await self.service.list_prefixes(
-                info.profile, info.bucket, info.prefix
+            prefixes = await self._call_with_sso_retry(
+                info.profile,
+                self.service.list_prefixes,
+                info.profile,
+                info.bucket,
+                info.prefix,
             )
         except Exception as exc:
             node.allow_expand = False
@@ -1638,6 +1745,27 @@ class S3Browser(App):
 
             overlay.update_detail("Listing buckets across configured profiles...")
             buckets, errors = await self.service.list_buckets_all()
+            if errors:
+                retry_profiles: list[Optional[str]] = []
+                seen_profiles: set[str] = set()
+                for profile, error in errors:
+                    if not self._is_sso_expired_error(error):
+                        continue
+                    label = self._profile_label(profile)
+                    if label in seen_profiles:
+                        continue
+                    seen_profiles.add(label)
+                    retry_profiles.append(profile)
+                if retry_profiles:
+                    for profile in retry_profiles:
+                        overlay.update_detail(
+                            f"SSO expired for '{self._profile_label(profile)}'. Re-authenticating..."
+                        )
+                        await self._reauth_sso_profile(profile)
+                    overlay.update_detail(
+                        "Retrying bucket listing after SSO re-authentication..."
+                    )
+                    buckets, errors = await self.service.list_buckets_all()
             if token != self._load_token:
                 return
             self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
@@ -1856,8 +1984,12 @@ class S3Browser(App):
                 continue
             attempted.append(profile)
             try:
-                prefixes, objects, has_any = await self.service.list_prefixes_and_objects(
-                    profile, info.bucket, info.prefix
+                prefixes, objects, has_any = await self._call_with_sso_retry(
+                    profile,
+                    self.service.list_prefixes_and_objects,
+                    profile,
+                    info.bucket,
+                    info.prefix,
                 )
             except Exception:
                 continue
@@ -1866,7 +1998,12 @@ class S3Browser(App):
             bucket_access = getattr(self.service, "bucket_access", None)
             if callable(bucket_access):
                 try:
-                    access = await bucket_access(profile, info.bucket)
+                    access = await self._call_with_sso_retry(
+                        profile,
+                        bucket_access,
+                        profile,
+                        info.bucket,
+                    )
                 except Exception:
                     access = BUCKET_ACCESS_GOOD
             self._switch_bucket_profile(
@@ -1940,8 +2077,12 @@ class S3Browser(App):
         self._clear_table()
         self.s3_table.add_row("", "Loading...", "", "", "")
         try:
-            prefixes, objects, has_any = await self.service.list_prefixes_and_objects(
-                info.profile, info.bucket, info.prefix
+            prefixes, objects, has_any = await self._call_with_sso_retry(
+                info.profile,
+                self.service.list_prefixes_and_objects,
+                info.profile,
+                info.bucket,
+                info.prefix,
             )
         except Exception as exc:
             fallback, attempted = await self._try_bucket_profile_fallback(info, node)
@@ -1986,7 +2127,12 @@ class S3Browser(App):
             bucket_access = getattr(self.service, "bucket_access", None)
             if callable(bucket_access):
                 try:
-                    access = await bucket_access(info.profile, info.bucket)
+                    access = await self._call_with_sso_retry(
+                        info.profile,
+                        bucket_access,
+                        info.profile,
+                        info.bucket,
+                    )
                 except Exception:
                     access = BUCKET_ACCESS_NO_DOWNLOAD
             if access == BUCKET_ACCESS_NO_VIEW:
@@ -2162,8 +2308,12 @@ class S3Browser(App):
         self._set_preview_text("Loading stats...")
         prefix = info.prefix or ""
         try:
-            prefixes, objects, _ = await self.service.list_prefixes_and_objects(
-                info.profile, info.bucket, prefix
+            prefixes, objects, _ = await self._call_with_sso_retry(
+                info.profile,
+                self.service.list_prefixes_and_objects,
+                info.profile,
+                info.bucket,
+                prefix,
             )
         except Exception as exc:
             if token != self._preview_token:
@@ -2189,7 +2339,9 @@ class S3Browser(App):
         self._set_preview_button("Scan", visible=True, disabled=True)
         prefix = info.prefix or ""
         try:
-            deep_values = await self.service.scan_prefix_recursive(
+            deep_values = await self._call_with_sso_retry(
+                info.profile,
+                self.service.scan_prefix_recursive,
                 info.profile,
                 info.bucket,
                 prefix,
@@ -2222,8 +2374,13 @@ class S3Browser(App):
         self._clear_stats_state()
         self._set_preview_button("More", visible=False)
         try:
-            data, total, truncated = await self.service.get_object_head(
-                info.profile, info.bucket, info.key, max_bytes=self._preview_bytes
+            data, total, truncated = await self._call_with_sso_retry(
+                info.profile,
+                self.service.get_object_head,
+                info.profile,
+                info.bucket,
+                info.key,
+                max_bytes=self._preview_bytes,
             )
         except Exception as exc:
             if token != self._preview_token:
@@ -2247,7 +2404,9 @@ class S3Browser(App):
         self._preview_token += 1
         token = self._preview_token
         try:
-            data, total, truncated = await self.service.get_object_range(
+            data, total, truncated = await self._call_with_sso_retry(
+                info.profile,
+                self.service.get_object_range,
                 info.profile,
                 info.bucket,
                 info.key,
