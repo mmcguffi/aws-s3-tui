@@ -580,6 +580,7 @@ class S3Browser(App):
         min-width: 6;
         height: 1;
         padding: 0 1;
+        margin-left: 1;
         margin-right: 1;
         content-align: center middle;
         background: $panel;
@@ -802,8 +803,8 @@ class S3Browser(App):
         yield Header()
         with Horizontal(id="path-bar"):
             yield Static("s3://", id="path-prefix")
-            yield Static("[-]", id="path-profile")
             yield Input(placeholder="bucket/prefix/", id="path-input")
+            yield Static("[-]", id="path-profile")
             yield Button("←", id="nav-back", compact=True)
             yield Button("→", id="nav-forward", compact=True)
             yield Button("↓", id="download", compact=True)
@@ -1020,6 +1021,66 @@ class S3Browser(App):
         badge.append(profile or "default", style=profile_style)
         badge.append("]", style="dim")
         self.path_profile.update(badge)
+
+    def _bucket_access_level(self, access: str) -> int:
+        if access == BUCKET_ACCESS_GOOD:
+            return 2
+        if access == BUCKET_ACCESS_NO_DOWNLOAD:
+            return 1
+        return 0
+
+    async def _resolve_profile_for_bucket_access(
+        self, bucket: str, current_profile: Optional[str]
+    ) -> tuple[Optional[str], str]:
+        bucket_access = getattr(self.service, "bucket_access", None)
+        if not callable(bucket_access):
+            return current_profile, self._bucket_access_for_name(bucket)
+
+        candidates = self._profile_candidates_for_bucket(bucket)
+        if current_profile not in candidates:
+            candidates.insert(0, current_profile)
+        candidates = [profile for profile in candidates if profile is not None] + (
+            [None] if None in candidates else []
+        )
+
+        profile_order: dict[Optional[str], int] = {}
+        if hasattr(self.service, "profiles"):
+            profile_order = {
+                profile: index for index, profile in enumerate(getattr(self.service, "profiles"))
+            }
+
+        checks = [bucket_access(profile, bucket) for profile in candidates]
+        results = await asyncio.gather(*checks, return_exceptions=True)
+
+        best_profile = current_profile
+        best_access = self._bucket_access_for_name(bucket)
+        best_key = (
+            self._bucket_access_level(best_access),
+            1 if best_profile is not None else 0,
+            -profile_order.get(best_profile, len(profile_order)),
+        )
+
+        for profile, result in zip(candidates, results):
+            access = BUCKET_ACCESS_NO_VIEW
+            if isinstance(result, str):
+                normalized = result.strip().lower()
+                if normalized in {
+                    BUCKET_ACCESS_GOOD,
+                    BUCKET_ACCESS_NO_DOWNLOAD,
+                    BUCKET_ACCESS_NO_VIEW,
+                }:
+                    access = normalized
+            key = (
+                self._bucket_access_level(access),
+                1 if profile is not None else 0,
+                -profile_order.get(profile, len(profile_order)),
+            )
+            if key > best_key:
+                best_key = key
+                best_profile = profile
+                best_access = access
+
+        return best_profile, best_access
 
     async def action_refresh(self) -> None:
         await self.refresh_buckets()
@@ -1571,6 +1632,30 @@ class S3Browser(App):
         if selected_profile != info.profile:
             info = NodeInfo(
                 profile=selected_profile,
+                bucket=info.bucket,
+                prefix=info.prefix,
+            )
+            try:
+                node.data = info
+            except Exception:
+                pass
+        resolved_profile, resolved_access = await self._resolve_profile_for_bucket_access(
+            info.bucket,
+            info.profile,
+        )
+        if (
+            resolved_profile != info.profile
+            or self._bucket_access_for_name(info.bucket) != resolved_access
+        ):
+            self._switch_bucket_profile(
+                info.bucket,
+                info.profile,
+                resolved_profile,
+                node,
+                new_access=resolved_access,
+            )
+            info = NodeInfo(
+                profile=resolved_profile,
                 bucket=info.bucket,
                 prefix=info.prefix,
             )
