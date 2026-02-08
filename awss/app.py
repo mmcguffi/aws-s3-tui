@@ -30,6 +30,12 @@ from textual.widgets import (
 )
 
 from .s3 import BucketInfo, ObjectInfo, S3Service
+from .s3 import (
+    BUCKET_ACCESS_GOOD,
+    BUCKET_ACCESS_NO_DOWNLOAD,
+    BUCKET_ACCESS_NO_VIEW,
+    BUCKET_ACCESS_UNKNOWN,
+)
 
 
 @dataclass(frozen=True)
@@ -964,9 +970,27 @@ class S3Browser(App):
 
     def _bucket_label(self, bucket: BucketInfo) -> Text:
         profile_label = bucket.profile or "default"
-        label = Text(bucket.name, style="bold cyan")
+        style = self._bucket_name_style(bucket.access)
+        label = Text(bucket.name, style=style)
         label.append(f" [{profile_label}]", style="dim")
         return label
+
+    def _bucket_name_style(self, access: str) -> str:
+        if access == BUCKET_ACCESS_NO_VIEW:
+            return "bold red"
+        if access == BUCKET_ACCESS_NO_DOWNLOAD:
+            return "bold #ff8c00"
+        if access == BUCKET_ACCESS_GOOD:
+            return "bold blue"
+        return "bold blue"
+
+    def _bucket_access_for_name(self, bucket: Optional[str]) -> str:
+        if not bucket:
+            return BUCKET_ACCESS_UNKNOWN
+        for info in self.buckets:
+            if info.name == bucket:
+                return info.access
+        return BUCKET_ACCESS_UNKNOWN
 
     async def action_refresh(self) -> None:
         await self.refresh_buckets()
@@ -1364,9 +1388,12 @@ class S3Browser(App):
         old_profile: Optional[str],
         new_profile: Optional[str],
         current_node: object,
+        new_access: Optional[str] = None,
     ) -> None:
         if old_profile == new_profile:
             return
+        existing_access = self._bucket_access_for_name(bucket)
+        chosen_access = new_access or existing_access
         old_bucket_key = (old_profile, bucket)
         bucket_node = self.bucket_nodes.get(old_bucket_key)
         if bucket_node is not None:
@@ -1377,7 +1404,9 @@ class S3Browser(App):
             except Exception:
                 pass
             try:
-                label = self._bucket_label(BucketInfo(name=bucket, profile=new_profile))
+                label = self._bucket_label(
+                    BucketInfo(name=bucket, profile=new_profile, access=chosen_access)
+                )
                 bucket_node.set_label(label)
             except Exception:
                 pass
@@ -1401,7 +1430,13 @@ class S3Browser(App):
         updated: list[BucketInfo] = []
         for info in self.buckets:
             if info.name == bucket:
-                updated.append(BucketInfo(name=info.name, profile=new_profile))
+                updated.append(
+                    BucketInfo(
+                        name=info.name,
+                        profile=new_profile,
+                        access=chosen_access,
+                    )
+                )
             else:
                 updated.append(info)
         self.buckets = updated
@@ -1445,7 +1480,20 @@ class S3Browser(App):
             except Exception:
                 continue
             new_info = NodeInfo(profile=profile, bucket=info.bucket, prefix=info.prefix)
-            self._switch_bucket_profile(info.bucket, info.profile, profile, node)
+            access = BUCKET_ACCESS_GOOD
+            bucket_access = getattr(self.service, "bucket_access", None)
+            if callable(bucket_access):
+                try:
+                    access = await bucket_access(profile, info.bucket)
+                except Exception:
+                    access = BUCKET_ACCESS_GOOD
+            self._switch_bucket_profile(
+                info.bucket,
+                info.profile,
+                profile,
+                node,
+                new_access=access,
+            )
             self.current_context = new_info
             self.notify(
                 f"Using profile '{profile or 'default'}' for bucket '{info.bucket}'.",
@@ -1799,8 +1847,11 @@ class S3Browser(App):
         created: list[tuple[object, str, tuple]] = []
         bucket_node = self.bucket_nodes.get((profile, bucket))
         if not bucket_node:
+            access = self._bucket_access_for_name(bucket)
             bucket_node = self.s3_tree.root.add(
-                Text(bucket, style="bold cyan"),
+                self._bucket_label(
+                    BucketInfo(name=bucket, profile=profile, access=access)
+                ),
                 data=NodeInfo(profile=profile, bucket=bucket, prefix=""),
                 allow_expand=True,
             )
@@ -1864,9 +1915,12 @@ class S3Browser(App):
     def _add_row(
         self, name: str, kind: str, size: str, modified: str, info: RowInfo
     ) -> None:
+        name_style = ""
+        if info.kind == "bucket":
+            name_style = self._bucket_name_style(self._bucket_access_for_name(info.bucket))
         row_key = self.s3_table.add_row(
             ellipsis_text(row_icon(info)),
-            ellipsis_text(name),
+            ellipsis_text(name, style=name_style),
             ellipsis_text(kind),
             size_cell(size, info.size),
             modified_cell(modified, info.last_modified),

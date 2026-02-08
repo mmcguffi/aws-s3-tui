@@ -12,11 +12,23 @@ import boto3
 import botocore.session
 from botocore.exceptions import ConfigNotFound
 
+BUCKET_ACCESS_UNKNOWN = "unknown"
+BUCKET_ACCESS_NO_VIEW = "no_view"
+BUCKET_ACCESS_NO_DOWNLOAD = "no_download"
+BUCKET_ACCESS_GOOD = "good"
+BUCKET_ACCESS_LEVELS = {
+    BUCKET_ACCESS_NO_VIEW: 0,
+    BUCKET_ACCESS_NO_DOWNLOAD: 1,
+    BUCKET_ACCESS_GOOD: 2,
+    BUCKET_ACCESS_UNKNOWN: 0,
+}
+
 
 @dataclass(frozen=True)
 class BucketInfo:
     name: str
     profile: Optional[str]
+    access: str = BUCKET_ACCESS_UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -118,102 +130,127 @@ class S3Service:
     ) -> list[BucketInfo]:
         by_name: dict[str, list[Optional[str]]] = {}
         for bucket in buckets:
-            by_name.setdefault(bucket.name, []).append(bucket.profile)
-        if all(len(profiles) == 1 for profiles in by_name.values()):
-            return buckets
+            profiles = by_name.setdefault(bucket.name, [])
+            if bucket.profile not in profiles:
+                profiles.append(bucket.profile)
+        if not by_name:
+            return []
 
-        preferred_profiles = self.load_cached_bucket_preferences()
-        profile_rank = {profile: index for index, profile in enumerate(self.profiles)}
+        probe_profiles = list(self.profiles) or [None]
+        profile_rank = {profile: index for index, profile in enumerate(probe_profiles)}
         probe_keys: list[tuple[str, Optional[str]]] = []
         probe_tasks: list[asyncio.Future] = []
-        unresolved: list[tuple[str, list[Optional[str]]]] = []
-        resolved: list[BucketInfo] = []
-        for name, profiles in by_name.items():
-            if len(profiles) == 1:
-                resolved.append(BucketInfo(name=name, profile=profiles[0]))
-                continue
-
-            has_non_default = any(profile is not None for profile in profiles)
-            if name in preferred_profiles:
-                preferred = preferred_profiles[name]
-                if preferred in profiles and (preferred is not None or not has_non_default):
-                    resolved.append(BucketInfo(name=name, profile=preferred))
-                    continue
-
-            # Probe only non-default candidates when multiple profiles can see a bucket.
-            # This keeps startup fast while still preferring profiles with usable access.
-            candidates = [profile for profile in profiles if profile is not None]
-            if not candidates:
-                best_profile = min(
-                    profiles, key=lambda profile: profile_rank.get(profile, len(profile_rank))
-                )
-                resolved.append(BucketInfo(name=name, profile=best_profile))
-                continue
-
-            unresolved.append((name, profiles))
-            for profile in candidates:
+        for name in by_name:
+            for profile in probe_profiles:
                 probe_keys.append((name, profile))
                 probe_tasks.append(
-                    asyncio.to_thread(self._score_profile_for_bucket, name, profile)
+                    asyncio.to_thread(
+                        self._probe_profile_access_for_bucket,
+                        name,
+                        profile,
+                    )
                 )
 
-        probe_scores: dict[tuple[str, Optional[str]], int] = {}
+        probe_access: dict[tuple[str, Optional[str]], str] = {}
         if probe_tasks:
             probe_results = await asyncio.gather(*probe_tasks, return_exceptions=True)
             for key, result in zip(probe_keys, probe_results):
                 if isinstance(result, Exception):
-                    probe_scores[key] = 0
-                else:
-                    probe_scores[key] = int(result)
+                    probe_access[key] = BUCKET_ACCESS_NO_VIEW
+                    continue
+                probe_access[key] = self._normalize_bucket_access(result)
 
-        for name, profiles in unresolved:
-            preferred = preferred_profiles.get(name) if name in preferred_profiles else None
-            candidates = [profile for profile in profiles if profile is not None]
-            if not candidates:
-                best_profile = min(
-                    profiles, key=lambda profile: profile_rank.get(profile, len(profile_rank))
-                )
-                resolved.append(BucketInfo(name=name, profile=best_profile))
-                continue
+        resolved: list[BucketInfo] = []
+        for name, listed_profiles in by_name.items():
+            available_profiles = set(listed_profiles)
+            ranked_profiles = list(probe_profiles)
+            if not ranked_profiles:
+                ranked_profiles = listed_profiles or [None]
 
-            def profile_key(profile: Optional[str]) -> tuple[int, int]:
-                score = probe_scores.get((name, profile), 0)
+            def profile_key(profile: Optional[str]) -> tuple[int, int, int, int]:
+                access = probe_access.get((name, profile), BUCKET_ACCESS_NO_VIEW)
+                level = self._bucket_access_level(access)
+                non_default = 1 if profile is not None else 0
+                listed = 1 if profile in available_profiles else 0
                 rank = profile_rank.get(profile, len(profile_rank))
-                return (score, -rank)
+                return (level, non_default, listed, -rank)
 
-            best_profile = max(candidates, key=profile_key)
-            best_score = probe_scores.get((name, best_profile), 0)
-            if best_score <= 0:
-                if preferred in profiles:
-                    best_profile = preferred
-                elif None in profiles:
-                    best_profile = None
-                else:
-                    best_profile = min(
-                        candidates,
-                        key=lambda profile: profile_rank.get(profile, len(profile_rank)),
-                    )
-            resolved.append(BucketInfo(name=name, profile=best_profile))
+            best_profile = max(ranked_profiles, key=profile_key)
+            best_access = probe_access.get((name, best_profile), BUCKET_ACCESS_NO_VIEW)
+            if self._bucket_access_level(best_access) <= 0:
+                fallback_profiles = listed_profiles or ranked_profiles
+                best_profile = max(
+                    fallback_profiles,
+                    key=lambda profile: (
+                        profile is not None,
+                        -(profile_rank.get(profile, len(profile_rank))),
+                    ),
+                )
+                best_access = BUCKET_ACCESS_NO_VIEW
+            resolved.append(
+                BucketInfo(name=name, profile=best_profile, access=best_access)
+            )
         return resolved
 
-    def _score_profile_for_bucket(self, bucket: str, profile: Optional[str]) -> int:
+    def _normalize_bucket_access(self, value: object) -> str:
+        if not isinstance(value, str):
+            return BUCKET_ACCESS_UNKNOWN
+        normalized = value.strip().lower()
+        if normalized in BUCKET_ACCESS_LEVELS:
+            return normalized
+        return BUCKET_ACCESS_UNKNOWN
+
+    def _bucket_access_level(self, access: str) -> int:
+        return BUCKET_ACCESS_LEVELS.get(access, 0)
+
+    def _probe_profile_access_for_bucket(
+        self, bucket: str, profile: Optional[str]
+    ) -> str:
         client = self._client(profile)
         try:
-            response = client.list_objects_v2(Bucket=bucket, MaxKeys=5)
+            response = client.list_objects_v2(Bucket=bucket, MaxKeys=10)
         except Exception:
-            return 0
-        score = 1
-        contents = response.get("Contents", [])
-        for entry in contents[:3]:
-            key = entry.get("Key")
-            if not key:
+            return BUCKET_ACCESS_NO_VIEW
+        contents = response.get("Contents", []) if isinstance(response, dict) else []
+        keys: list[str] = []
+        for entry in contents[:10]:
+            if not isinstance(entry, dict):
                 continue
+            key = entry.get("Key")
+            if not isinstance(key, str) or not key:
+                continue
+            keys.append(key)
+        if not keys:
+            return BUCKET_ACCESS_GOOD
+
+        for key in keys[:5]:
             try:
-                client.head_object(Bucket=bucket, Key=key)
-                score += 1
+                response = client.get_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Range="bytes=0-0",
+                )
             except Exception:
                 continue
-        return score
+            body = response.get("Body") if isinstance(response, dict) else None
+            if body is not None:
+                try:
+                    body.read(1)
+                finally:
+                    try:
+                        body.close()
+                    except Exception:
+                        pass
+            return BUCKET_ACCESS_GOOD
+        return BUCKET_ACCESS_NO_DOWNLOAD
+
+    async def bucket_access(self, profile: Optional[str], bucket: str) -> str:
+        access = await asyncio.to_thread(
+            self._probe_profile_access_for_bucket,
+            bucket,
+            profile,
+        )
+        return self._normalize_bucket_access(access)
 
     def _load_full_config(self) -> dict:
         session = botocore.session.get_session()
@@ -308,6 +345,9 @@ class S3Service:
             return None
         return normalized
 
+    def _decode_access(self, value: object) -> str:
+        return self._normalize_bucket_access(value)
+
     def _read_bucket_cache(self) -> tuple[Optional[datetime], list[BucketInfo]]:
         try:
             payload = json.loads(self._bucket_cache_path.read_text())
@@ -329,7 +369,8 @@ class S3Service:
             if not stripped:
                 continue
             profile = self._decode_profile(item.get("profile"))
-            buckets.append(BucketInfo(name=stripped, profile=profile))
+            access = self._decode_access(item.get("access"))
+            buckets.append(BucketInfo(name=stripped, profile=profile, access=access))
         saved_at = self._parse_cache_saved_at(payload.get("saved_at"))
         return saved_at, buckets
 
@@ -354,12 +395,16 @@ class S3Service:
         return buckets
 
     def save_bucket_cache(self, buckets: list[BucketInfo]) -> bool:
-        latest_by_name: dict[str, Optional[str]] = {}
+        latest_by_name: dict[str, BucketInfo] = {}
         for bucket in buckets:
-            latest_by_name[bucket.name] = bucket.profile
+            latest_by_name[bucket.name] = bucket
         rows = [
-            {"name": name, "profile": profile}
-            for name, profile in sorted(latest_by_name.items(), key=lambda item: item[0])
+            {
+                "name": name,
+                "profile": info.profile,
+                "access": self._normalize_bucket_access(info.access),
+            }
+            for name, info in sorted(latest_by_name.items(), key=lambda item: item[0])
         ]
         payload = {
             "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -388,7 +433,13 @@ class S3Service:
                 errors.append((profile, result))
                 continue
             for name in result:
-                buckets.append(BucketInfo(name=name, profile=profile))
+                buckets.append(
+                    BucketInfo(
+                        name=name,
+                        profile=profile,
+                        access=BUCKET_ACCESS_UNKNOWN,
+                    )
+                )
         return buckets, errors
 
     def _list_buckets(self, profile: Optional[str]) -> list[str]:

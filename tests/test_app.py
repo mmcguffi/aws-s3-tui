@@ -10,7 +10,12 @@ from awss.app import (
     format_size,
     format_time,
 )
-from awss.s3 import BucketInfo
+from awss.s3 import (
+    BUCKET_ACCESS_GOOD,
+    BUCKET_ACCESS_NO_DOWNLOAD,
+    BUCKET_ACCESS_NO_VIEW,
+    BucketInfo,
+)
 
 
 class _DummyNode:
@@ -123,6 +128,12 @@ class TestAppHelpers(unittest.TestCase):
         self.assertNotIn((None, "bucket-a", "foo/"), app.prefix_nodes)
         self.assertIn(("dev", "bucket-a", "foo/"), app.prefix_nodes)
         self.assertEqual(prefix_node.data.profile, "dev")
+
+    def test_bucket_name_style(self) -> None:
+        app = S3Browser(profiles=["default"])
+        self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_NO_VIEW), "bold red")
+        self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_NO_DOWNLOAD), "bold #ff8c00")
+        self.assertEqual(app._bucket_name_style(BUCKET_ACCESS_GOOD), "bold blue")
 
 
 if __name__ == "__main__":
