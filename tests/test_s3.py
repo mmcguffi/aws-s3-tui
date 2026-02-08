@@ -146,6 +146,31 @@ class TestS3Service(unittest.TestCase):
             service._aws_config_hash = lambda: "hash-two"  # type: ignore[method-assign]
             self.assertEqual(service.load_bucket_cache(), [])
 
+    def test_aws_config_hash_changes_when_credentials_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            config_path = base / "config"
+            credentials_path = base / "credentials"
+            config_path.write_text("[default]\nregion = us-east-1\n")
+            credentials_path.write_text(
+                "[default]\naws_access_key_id = a\naws_secret_access_key = b\n"
+            )
+            service = S3Service(profiles=[None])
+            service._aws_config_path = lambda: config_path  # type: ignore[method-assign]
+            service._aws_credentials_path = (  # type: ignore[method-assign]
+                lambda: credentials_path
+            )
+
+            first_hash = service._aws_config_hash()
+            credentials_path.write_text(
+                "[default]\naws_access_key_id = a\naws_secret_access_key = c\n"
+            )
+            second_hash = service._aws_config_hash()
+
+            self.assertIsNotNone(first_hash)
+            self.assertIsNotNone(second_hash)
+            self.assertNotEqual(first_hash, second_hash)
+
     def test_bucket_filter_state_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "bucket-cache.json"

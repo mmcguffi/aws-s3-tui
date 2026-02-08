@@ -115,13 +115,29 @@ class S3Service:
     def _aws_config_path(self) -> Path:
         return Path.home() / ".aws" / "config"
 
+    def _aws_credentials_path(self) -> Path:
+        return Path.home() / ".aws" / "credentials"
+
     def _aws_config_hash(self) -> Optional[str]:
-        path = self._aws_config_path()
-        try:
-            data = path.read_bytes()
-        except Exception:
+        hasher = hashlib.sha256()
+        found = False
+        sources = (
+            ("config", self._aws_config_path()),
+            ("credentials", self._aws_credentials_path()),
+        )
+        for label, path in sources:
+            try:
+                data = path.read_bytes()
+            except Exception:
+                continue
+            hasher.update(label.encode("utf-8"))
+            hasher.update(b"\0")
+            hasher.update(data)
+            hasher.update(b"\0")
+            found = True
+        if not found:
             return None
-        return hashlib.sha256(data).hexdigest()
+        return hasher.hexdigest()
 
     def _client(self, profile: Optional[str]):
         key = self._profile_key(profile)
