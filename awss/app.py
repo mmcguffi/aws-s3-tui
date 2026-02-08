@@ -371,6 +371,8 @@ class DownloadDialog(ModalScreen[Optional[str]]):
 
 
 class RefreshOverlay(ModalScreen[None]):
+    BINDINGS = []
+
     CSS = """
     RefreshOverlay {
         align: center middle;
@@ -417,6 +419,14 @@ class RefreshOverlay(ModalScreen[None]):
         if not self.is_mounted:
             return
         self.query_one("#refresh-overlay-detail", Static).update(detail)
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key != "escape":
+            return
+        app = self.app
+        if hasattr(app, "action_confirm_quit"):
+            app.action_confirm_quit()
+        event.stop()
 
 
 ONE_MB = 1024**2
@@ -1429,6 +1439,12 @@ class S3Browser(App):
     async def refresh_buckets(self) -> None:
         self._load_token += 1
         token = self._load_token
+        overlay = RefreshOverlay(
+            "Refreshing Buckets",
+            "Listing buckets across configured profiles...",
+        )
+        self.push_screen(overlay)
+        await asyncio.sleep(0)
         self.s3_tree.clear()
         self.bucket_nodes.clear()
         self.bucket_profile_candidates.clear()
@@ -1448,36 +1464,64 @@ class S3Browser(App):
         self._set_profile_indicator(None)
         self.path_input.placeholder = "Loading buckets..."
         self.s3_tree.root.expand()
-        cached: list[BucketInfo] = []
-        load_bucket_cache = getattr(self.service, "load_bucket_cache", None)
-        if callable(load_bucket_cache):
-            cached = await asyncio.to_thread(load_bucket_cache)
-        if token != self._load_token:
-            return
-        has_cached = bool(cached)
-        if has_cached:
-            self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
-                cached
-            )
-            self.path_input.placeholder = "Refreshing buckets..."
-            self._render_bucket_nodes(cached)
+        try:
+            cached: list[BucketInfo] = []
+            load_bucket_cache = getattr(self.service, "load_bucket_cache", None)
+            if callable(load_bucket_cache):
+                cached = await asyncio.to_thread(load_bucket_cache)
+            if token != self._load_token:
+                return
+            has_cached = bool(cached)
+            if has_cached:
+                self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
+                    cached
+                )
+                self.path_input.placeholder = "Refreshing buckets..."
+                self._render_bucket_nodes(cached)
 
-        buckets, errors = await self.service.list_buckets_all()
-        if token != self._load_token:
-            return
-        self.bucket_profile_candidates = self._collect_bucket_profile_candidates(buckets)
-        buckets = await self.service.select_best_bucket_profiles(buckets)
-        if token != self._load_token:
-            return
-        if buckets:
-            save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
-            if callable(save_bucket_cache):
-                await asyncio.to_thread(save_bucket_cache, buckets)
-        if not buckets and has_cached and errors:
-            self.path_input.placeholder = "bucket/prefix/ (cached)"
-            self.notify("Using cached buckets because live refresh failed.", severity="warning")
+            overlay.update_detail("Listing buckets across configured profiles...")
+            buckets, errors = await self.service.list_buckets_all()
+            if token != self._load_token:
+                return
+            self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
+                buckets
+            )
+
+            overlay.update_detail("Testing permissions to choose best profile per bucket...")
+            buckets = await self.service.select_best_bucket_profiles(buckets)
+            if token != self._load_token:
+                return
+
+            if buckets:
+                save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
+                if callable(save_bucket_cache):
+                    await asyncio.to_thread(save_bucket_cache, buckets)
+
+            if not buckets and has_cached and errors:
+                self.path_input.placeholder = "bucket/prefix/ (cached)"
+                self.notify(
+                    "Using cached buckets because live refresh failed.",
+                    severity="warning",
+                )
+                if errors:
+                    failed = ", ".join(
+                        (profile or "default") for profile, _exc in errors[:3]
+                    )
+                    extra = ""
+                    if len(errors) > 3:
+                        extra = f" (+{len(errors) - 3} more)"
+                    self.notify(
+                        f"Some credentials could not list buckets: {failed}{extra}",
+                        severity="warning",
+                    )
+                return
+
+            self.path_input.placeholder = "bucket/prefix/"
+            self._render_bucket_nodes(buckets)
             if errors:
-                failed = ", ".join((profile or "default") for profile, _exc in errors[:3])
+                failed = ", ".join(
+                    (profile or "default") for profile, _exc in errors[:3]
+                )
                 extra = ""
                 if len(errors) > 3:
                     extra = f" (+{len(errors) - 3} more)"
@@ -1485,18 +1529,12 @@ class S3Browser(App):
                     f"Some credentials could not list buckets: {failed}{extra}",
                     severity="warning",
                 )
-            return
-        self.path_input.placeholder = "bucket/prefix/"
-        self._render_bucket_nodes(buckets)
-        if errors:
-            failed = ", ".join((profile or "default") for profile, _exc in errors[:3])
-            extra = ""
-            if len(errors) > 3:
-                extra = f" (+{len(errors) - 3} more)"
-            self.notify(
-                f"Some credentials could not list buckets: {failed}{extra}",
-                severity="warning",
-            )
+        finally:
+            try:
+                if overlay.is_mounted:
+                    overlay.dismiss(None)
+            except Exception:
+                pass
 
     def _profile_candidates_for_bucket(self, bucket: str) -> list[Optional[str]]:
         candidates = list(self.bucket_profile_candidates.get(bucket, []))
