@@ -429,6 +429,73 @@ class RefreshOverlay(ModalScreen[None]):
         event.stop()
 
 
+PROFILE_DEFAULT_SENTINEL = "__default__"
+
+
+class ProfileSelectDialog(ModalScreen[Optional[str]]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    CSS = """
+    ProfileSelectDialog {
+        align: right top;
+        background: transparent;
+        padding: 3 2 0 0;
+    }
+
+    #profile-dialog {
+        width: 28;
+        max-width: 40;
+        min-width: 18;
+        height: auto;
+        padding: 1;
+        border: round $panel;
+        background: $panel;
+        color: $text;
+    }
+
+    #profile-title {
+        width: 100%;
+        content-align: left middle;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    .profile-option {
+        width: 100%;
+        content-align: left middle;
+        border: none;
+        background: transparent;
+        color: $text;
+    }
+    """
+
+    def __init__(
+        self, options: list[tuple[str, str]], current_value: Optional[str]
+    ) -> None:
+        super().__init__()
+        self._options = options
+        self._current_value = current_value
+        self._button_values: dict[str, str] = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="profile-dialog"):
+            yield Static("Choose profile", id="profile-title")
+            for index, (label, value) in enumerate(self._options):
+                marker = "• " if value == self._current_value else "  "
+                button_id = f"profile-option-{index}"
+                self._button_values[button_id] = value
+                yield Button(f"{marker}{label}", id=button_id, classes="profile-option")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        value = self._button_values.get(event.button.id or "")
+        if value is None:
+            return
+        self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 ONE_MB = 1024**2
 HUNDRED_MB = 100 * ONE_MB
 ONE_GB = 1024**3
@@ -644,6 +711,19 @@ class S3Browser(App):
         content-align: center middle;
         background: $panel;
         color: $text-muted;
+        border: none;
+    }
+
+    #path-profile:hover {
+        background: $surface-lighten-1 20%;
+    }
+
+    #path-profile:focus {
+        background: $surface-lighten-1 30%;
+    }
+
+    #path-profile:disabled {
+        color: $text-muted 60%;
     }
 
     #path-input {
@@ -863,7 +943,7 @@ class S3Browser(App):
         with Horizontal(id="path-bar"):
             yield Static("s3://", id="path-prefix")
             yield Input(placeholder="bucket/prefix/", id="path-input")
-            yield Static("[-]", id="path-profile")
+            yield Button("[-]", id="path-profile", compact=True)
             yield Button("←", id="nav-back", compact=True)
             yield Button("→", id="nav-forward", compact=True)
             yield Button("↓", id="download", compact=True)
@@ -903,7 +983,7 @@ class S3Browser(App):
         self.s3_tree.show_root = False
         self.s3_table = self.query_one("#s3-table", DataTable)
         self.path_input = self.query_one("#path-input", Input)
-        self.path_profile = self.query_one("#path-profile", Static)
+        self.path_profile = self.query_one("#path-profile", Button)
         self.nav_back = self.query_one("#nav-back", Button)
         self.nav_forward = self.query_one("#nav-forward", Button)
         self.download_button = self.query_one("#download", Button)
@@ -1072,14 +1152,15 @@ class S3Browser(App):
         if not hasattr(self, "path_profile"):
             return
         if not bucket:
-            self.path_profile.update(Text("[-]", style="dim"))
+            self.path_profile.label = "[-]"
+            self.path_profile.disabled = True
+            self.path_profile.styles.color = "#8a8a8a"
             return
         access = self._bucket_access_for_name(bucket)
-        profile_style = self._bucket_name_style(access)
-        badge = Text("[", style="dim")
-        badge.append(profile or "default", style=profile_style)
-        badge.append("]", style="dim")
-        self.path_profile.update(badge)
+        profile_style = self._bucket_name_style(access).replace("bold ", "")
+        self.path_profile.disabled = False
+        self.path_profile.label = f"[{profile or 'default'}]"
+        self.path_profile.styles.color = profile_style
 
     def _bucket_access_level(self, access: str) -> int:
         if access == BUCKET_ACCESS_GOOD:
@@ -1301,6 +1382,9 @@ class S3Browser(App):
         if event.button.id == "preview-more":
             await self.action_preview_more()
             return
+        if event.button.id == "path-profile":
+            await self.action_choose_profile()
+            return
         if event.button.id == "nav-back":
             self.action_back()
             return
@@ -1315,6 +1399,79 @@ class S3Browser(App):
         self.set_focus(self.path_input)
         if hasattr(self.path_input, "select_all"):
             self.path_input.select_all()
+
+    async def action_choose_profile(self) -> None:
+        if not self.current_context or not self.current_context.bucket:
+            self.notify("Open a bucket to choose profile.", severity="warning")
+            return
+        bucket = self.current_context.bucket
+        current_profile = self._profile_for_bucket(bucket)
+        options: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for profile in self._profile_candidates_for_bucket(bucket):
+            value = PROFILE_DEFAULT_SENTINEL if profile is None else profile
+            if value in seen:
+                continue
+            seen.add(value)
+            label = profile or "default"
+            options.append((label, value))
+        if not options:
+            self.notify("No profiles available.", severity="warning")
+            return
+        current_value = (
+            PROFILE_DEFAULT_SENTINEL if current_profile is None else current_profile
+        )
+        selected = await self.push_screen_wait(
+            ProfileSelectDialog(options, current_value=current_value)
+        )
+        if not selected:
+            return
+        profile = None if selected == PROFILE_DEFAULT_SENTINEL else selected
+        if profile == current_profile:
+            return
+
+        access = self._bucket_access_for_name(bucket)
+        bucket_access = getattr(self.service, "bucket_access", None)
+        if callable(bucket_access):
+            try:
+                access = await bucket_access(profile, bucket)
+            except Exception:
+                access = BUCKET_ACCESS_NO_VIEW
+
+        node = self.s3_tree.cursor_node
+        if node is None:
+            node = self.bucket_nodes.get((current_profile, bucket))
+        if node is None:
+            for (_profile, name), candidate in self.bucket_nodes.items():
+                if name == bucket:
+                    node = candidate
+                    break
+
+        if node is not None:
+            self._switch_bucket_profile(
+                bucket,
+                current_profile,
+                profile,
+                node,
+                new_access=access,
+            )
+        else:
+            updated: list[BucketInfo] = []
+            for info in self.buckets:
+                if info.name == bucket:
+                    updated.append(
+                        BucketInfo(name=info.name, profile=profile, access=access)
+                    )
+                else:
+                    updated.append(info)
+            self.buckets = updated
+
+        save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
+        if callable(save_bucket_cache):
+            await asyncio.to_thread(save_bucket_cache, self.buckets)
+
+        self._set_profile_indicator(profile, bucket)
+        self.navigate_to(profile, bucket, self.current_context.prefix)
 
     def action_back(self) -> None:
         if self._history_index <= 0:
