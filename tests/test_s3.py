@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -110,6 +111,80 @@ class TestS3Service(unittest.TestCase):
                 {("bucket-a", "dev", BUCKET_ACCESS_NO_VIEW)},
             )
 
+    def test_select_best_bucket_profiles_reports_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "bucket-cache.json"
+            service = self._StubService(
+                profiles=[None, "dev", "prod"],
+                cache_path=cache_path,
+                access_by_profile={
+                    ("bucket-a", None): BUCKET_ACCESS_NO_VIEW,
+                    ("bucket-a", "dev"): BUCKET_ACCESS_NO_DOWNLOAD,
+                    ("bucket-a", "prod"): BUCKET_ACCESS_GOOD,
+                    ("bucket-b", None): BUCKET_ACCESS_GOOD,
+                    ("bucket-b", "dev"): BUCKET_ACCESS_GOOD,
+                    ("bucket-b", "prod"): BUCKET_ACCESS_GOOD,
+                },
+            )
+            buckets = [
+                BucketInfo(name="bucket-a", profile=None),
+                BucketInfo(name="bucket-b", profile="dev"),
+            ]
+            progress: list[tuple[int, int, str, str | None]] = []
+
+            def on_progress(
+                completed: int, total: int, bucket: str, profile: str | None
+            ) -> None:
+                progress.append((completed, total, bucket, profile))
+
+            asyncio.run(
+                service.select_best_bucket_profiles(
+                    buckets, progress_callback=on_progress
+                )
+            )
+
+            self.assertTrue(progress)
+            self.assertEqual(progress[-1][0], progress[-1][1])
+            self.assertEqual(progress[-1][1], 6)
+
+    def test_list_buckets_all_reports_progress(self) -> None:
+        class _ListStubService(S3Service):
+            def __init__(self, profiles, cache_path) -> None:
+                super().__init__(profiles=profiles, cache_path=cache_path)
+
+            def _list_buckets(self, profile):  # type: ignore[override]
+                if profile == "prod":
+                    raise Exception("boom")
+                if profile == "dev":
+                    return ["bucket-dev"]
+                return ["bucket-default"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "bucket-cache.json"
+            service = _ListStubService(
+                profiles=[None, "dev", "prod"],
+                cache_path=cache_path,
+            )
+            progress: list[tuple[int, int, str | None, bool]] = []
+
+            def on_progress(
+                completed: int,
+                total: int,
+                profile: str | None,
+                error: Exception | None,
+            ) -> None:
+                progress.append((completed, total, profile, error is not None))
+
+            buckets, errors = asyncio.run(
+                service.list_buckets_all(progress_callback=on_progress)
+            )
+
+            self.assertEqual(len(progress), 3)
+            self.assertEqual(progress[-1][0], 3)
+            self.assertEqual(progress[-1][1], 3)
+            self.assertEqual(len(buckets), 2)
+            self.assertEqual(len(errors), 1)
+
     def test_bucket_cache_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "bucket-cache.json"
@@ -129,6 +204,24 @@ class TestS3Service(unittest.TestCase):
             ]
             self.assertTrue(service.save_bucket_cache(expected))
             self.assertEqual(service.load_bucket_cache(), expected)
+
+    def test_bucket_cache_ignore_ttl_uses_hash_matched_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "bucket-cache.json"
+            service = S3Service(
+                profiles=[None, "dev"],
+                cache_path=cache_path,
+                cache_ttl_seconds=1,
+            )
+            expected = [
+                BucketInfo(name="alpha", profile=None, access=BUCKET_ACCESS_NO_VIEW),
+            ]
+            self.assertTrue(service.save_bucket_cache(expected))
+            data = json.loads(cache_path.read_text())
+            data["saved_at"] = "2000-01-01T00:00:00+00:00"
+            cache_path.write_text(json.dumps(data))
+            self.assertEqual(service.load_bucket_cache(), [])
+            self.assertEqual(service.load_bucket_cache(ignore_ttl=True), expected)
 
     def test_bucket_cache_invalidated_on_aws_config_hash_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

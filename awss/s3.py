@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import boto3
 import botocore.session
@@ -178,7 +178,11 @@ class S3Service:
         return targets
 
     async def select_best_bucket_profiles(
-        self, buckets: list[BucketInfo]
+        self,
+        buckets: list[BucketInfo],
+        progress_callback: Optional[
+            Callable[[int, int, str, Optional[str]], None]
+        ] = None,
     ) -> list[BucketInfo]:
         by_name: dict[str, list[Optional[str]]] = {}
         for bucket in buckets:
@@ -190,23 +194,38 @@ class S3Service:
 
         probe_profiles = list(self.profiles) or [None]
         profile_rank = {profile: index for index, profile in enumerate(probe_profiles)}
-        probe_keys: list[tuple[str, Optional[str]]] = []
-        probe_tasks: list[asyncio.Future] = []
+
+        async def run_probe(
+            bucket_name: str, profile: Optional[str]
+        ) -> tuple[str, Optional[str], object]:
+            try:
+                result = await asyncio.to_thread(
+                    self._probe_profile_access_for_bucket,
+                    bucket_name,
+                    profile,
+                )
+            except Exception as exc:
+                return bucket_name, profile, exc
+            return bucket_name, profile, result
+
+        probe_tasks: list[asyncio.Task[tuple[str, Optional[str], object]]] = []
         for name in by_name:
             for profile in probe_profiles:
-                probe_keys.append((name, profile))
-                probe_tasks.append(
-                    asyncio.to_thread(
-                        self._probe_profile_access_for_bucket,
-                        name,
-                        profile,
-                    )
-                )
+                probe_tasks.append(asyncio.create_task(run_probe(name, profile)))
 
         probe_access: dict[tuple[str, Optional[str]], str] = {}
         if probe_tasks:
-            probe_results = await asyncio.gather(*probe_tasks, return_exceptions=True)
-            for key, result in zip(probe_keys, probe_results):
+            total = len(probe_tasks)
+            completed = 0
+            for task in asyncio.as_completed(probe_tasks):
+                name, profile, result = await task
+                completed += 1
+                if callable(progress_callback):
+                    try:
+                        progress_callback(completed, total, name, profile)
+                    except Exception:
+                        pass
+                key = (name, profile)
                 if isinstance(result, Exception):
                     probe_access[key] = BUCKET_ACCESS_NO_VIEW
                     continue
@@ -479,12 +498,14 @@ class S3Service:
             preferred[bucket.name] = bucket.profile
         return preferred
 
-    def load_bucket_cache(self) -> list[BucketInfo]:
+    def load_bucket_cache(self, ignore_ttl: bool = False) -> list[BucketInfo]:
         saved_at, buckets, cache_hash = self._read_bucket_cache()
         if not buckets:
             return []
         if cache_hash != self._aws_config_hash():
             return []
+        if ignore_ttl:
+            return buckets
         if self._bucket_cache_ttl_seconds <= 0:
             return buckets
         if saved_at is None:
@@ -601,14 +622,36 @@ class S3Service:
 
     async def list_buckets_all(
         self,
+        progress_callback: Optional[
+            Callable[[int, int, Optional[str], Optional[Exception]], None]
+        ] = None,
     ) -> tuple[list[BucketInfo], list[tuple[Optional[str], Exception]]]:
-        tasks = [
-            asyncio.to_thread(self._list_buckets, profile) for profile in self.profiles
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        async def run_list(profile: Optional[str]) -> tuple[Optional[str], object]:
+            try:
+                result = await asyncio.to_thread(self._list_buckets, profile)
+            except Exception as exc:
+                return profile, exc
+            return profile, result
+
+        tasks = [asyncio.create_task(run_list(profile)) for profile in self.profiles]
+        results_by_profile: dict[Optional[str], object] = {}
+        total = len(tasks)
+        completed = 0
+        for task in asyncio.as_completed(tasks):
+            profile, result = await task
+            results_by_profile[profile] = result
+            completed += 1
+            if callable(progress_callback):
+                error = result if isinstance(result, Exception) else None
+                try:
+                    progress_callback(completed, total, profile, error)
+                except Exception:
+                    pass
+
         buckets: list[BucketInfo] = []
         errors: list[tuple[Optional[str], Exception]] = []
-        for profile, result in zip(self.profiles, results):
+        for profile in self.profiles:
+            result = results_by_profile.get(profile, [])
             if isinstance(result, Exception):
                 errors.append((profile, result))
                 continue

@@ -3,16 +3,19 @@ import unittest
 from unittest.mock import patch
 
 from awss.app import S3Browser
+from awss.s3 import BUCKET_ACCESS_GOOD, BucketInfo
 
 
 class _StubService:
+    profiles = [None]
+
     def sso_login_targets(self) -> list[str]:
         return []
 
-    async def select_best_bucket_profiles(self, buckets):
+    async def select_best_bucket_profiles(self, buckets, progress_callback=None):
         return buckets
 
-    async def list_buckets_all(self):
+    async def list_buckets_all(self, progress_callback=None):
         return [], []
 
     async def list_prefixes(self, *_args, **_kwargs):
@@ -26,6 +29,25 @@ class _StubService:
 
     async def get_object_range(self, *_args, **_kwargs):
         return b"", None, False
+
+
+class _CachedStubService(_StubService):
+    def __init__(self) -> None:
+        self.list_calls = 0
+
+    def load_bucket_cache(self, ignore_ttl: bool = False):
+        return [
+            BucketInfo(
+                name="cached-bucket",
+                profile=None,
+                access=BUCKET_ACCESS_GOOD,
+                is_empty=False,
+            )
+        ]
+
+    async def list_buckets_all(self, progress_callback=None):
+        self.list_calls += 1
+        return [], []
 
 
 class TestTuiMount(unittest.IsolatedAsyncioTestCase):
@@ -72,6 +94,15 @@ class TestTuiMount(unittest.IsolatedAsyncioTestCase):
             app.set_focus(app.s3_tree)
             await pilot.press("a")
             self.assertIs(app.focused, app.s3_tree)
+
+    async def test_startup_uses_cached_buckets_without_live_listing(self) -> None:
+        app = S3Browser(profiles=["default"])
+        cached_service = _CachedStubService()
+        app.service = cached_service
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await asyncio.sleep(0.05)
+            self.assertEqual(cached_service.list_calls, 0)
 
 
 if __name__ == "__main__":

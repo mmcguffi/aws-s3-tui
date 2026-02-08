@@ -403,23 +403,48 @@ class RefreshOverlay(ModalScreen[None]):
         color: $text-muted;
         content-align: center middle;
     }
+
+    #refresh-overlay-progress {
+        width: 100%;
+        margin-top: 1;
+        color: $text;
+        content-align: center middle;
+    }
     """
 
     def __init__(self, title: str, detail: str) -> None:
         super().__init__()
         self._title = title
         self._detail = detail
+        self._progress = ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="refresh-overlay-box"):
             yield Static(self._title, id="refresh-overlay-title")
-            yield Static(self._detail, id="refresh-overlay-detail")
+            yield Static(self._detail, id="refresh-overlay-detail", markup=False)
+            yield Static("", id="refresh-overlay-progress", markup=False)
 
     def update_detail(self, detail: str) -> None:
         self._detail = detail
         if not self.is_mounted:
             return
         self.query_one("#refresh-overlay-detail", Static).update(detail)
+
+    def update_progress(self, completed: int, total: int, label: str = "") -> None:
+        safe_total = max(1, int(total))
+        safe_completed = max(0, min(int(completed), safe_total))
+        ratio = safe_completed / safe_total
+        width = 20
+        filled = int(ratio * width)
+        if safe_completed > 0 and filled == 0:
+            filled = 1
+        bar = "#" * filled + "-" * (width - filled)
+        percent = int(ratio * 100)
+        prefix = f"{label}: " if label else ""
+        self._progress = f"{prefix}[{bar}] {safe_completed}/{safe_total} ({percent}%)"
+        if not self.is_mounted:
+            return
+        self.query_one("#refresh-overlay-progress", Static).update(self._progress)
 
     def on_key(self, event: events.Key) -> None:
         if event.key != "escape":
@@ -1134,7 +1159,7 @@ class S3Browser(App):
 
     async def _startup_refresh_flow(self) -> None:
         await self._ensure_sso_logins()
-        await self.refresh_buckets()
+        await self.refresh_buckets(force=False)
 
     async def _ensure_sso_logins(self) -> None:
         if not hasattr(self.service, "sso_login_targets"):
@@ -1615,7 +1640,7 @@ class S3Browser(App):
         return best_profile, best_access
 
     def action_refresh(self) -> None:
-        self.run_worker(self.refresh_buckets(), exclusive=True)
+        self.run_worker(self.refresh_buckets(force=True), exclusive=True)
 
     def action_confirm_quit(self) -> None:
         now = monotonic()
@@ -2043,32 +2068,52 @@ class S3Browser(App):
         return resolved
 
     async def _resolve_bucket_empty_flags(
-        self, buckets: list[BucketInfo]
+        self,
+        buckets: list[BucketInfo],
+        progress_callback=None,
     ) -> list[BucketInfo]:
         is_bucket_empty = getattr(self.service, "is_bucket_empty", None)
         if not callable(is_bucket_empty):
             return buckets
-        tasks = []
-        indices: list[int] = []
+        checks: list[asyncio.Task[tuple[int, BucketInfo, object]]] = []
+
+        async def run_check(
+            index: int, bucket_info: BucketInfo
+        ) -> tuple[int, BucketInfo, object]:
+            try:
+                result = await self._call_with_sso_retry(
+                    bucket_info.profile,
+                    is_bucket_empty,
+                    bucket_info.profile,
+                    bucket_info.name,
+                )
+            except Exception as exc:
+                return index, bucket_info, exc
+            return index, bucket_info, result
+
         for index, bucket in enumerate(buckets):
             if bucket.access == BUCKET_ACCESS_NO_VIEW:
                 continue
-            indices.append(index)
-            tasks.append(
-                self._call_with_sso_retry(
-                    bucket.profile,
-                    is_bucket_empty,
-                    bucket.profile,
-                    bucket.name,
-                )
-            )
-        if not tasks:
+            checks.append(asyncio.create_task(run_check(index, bucket)))
+        if not checks:
             return buckets
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        total = len(checks)
+        completed = 0
+        resolved_by_index: dict[int, bool] = {}
+        for task in asyncio.as_completed(checks):
+            index, bucket, result = await task
+            completed += 1
+            if callable(progress_callback):
+                try:
+                    progress_callback(completed, total, bucket.name)
+                except Exception:
+                    pass
+            resolved_by_index[index] = result if isinstance(result, bool) else False
+
         resolved = list(buckets)
-        for index, result in zip(indices, results):
+        for index, is_empty in resolved_by_index.items():
             bucket = resolved[index]
-            is_empty = result if isinstance(result, bool) else False
             resolved[index] = BucketInfo(
                 name=bucket.name,
                 profile=bucket.profile,
@@ -2097,7 +2142,7 @@ class S3Browser(App):
         self.s3_tree.root.expand()
         self.s3_tree.select_node(self.s3_tree.root)
 
-    async def refresh_buckets(self) -> None:
+    async def refresh_buckets(self, force: bool = False) -> None:
         self._load_token += 1
         token = self._load_token
         overlay = RefreshOverlay(
@@ -2105,6 +2150,8 @@ class S3Browser(App):
             "Listing buckets across configured profiles...",
         )
         await self.push_screen(overlay)
+        overlay.update_progress(0, 1, "Init")
+        await asyncio.sleep(0)
         self.s3_tree.clear()
         self.bucket_nodes.clear()
         self.bucket_profile_candidates.clear()
@@ -2128,7 +2175,7 @@ class S3Browser(App):
             cached: list[BucketInfo] = []
             load_bucket_cache = getattr(self.service, "load_bucket_cache", None)
             if callable(load_bucket_cache):
-                cached = await asyncio.to_thread(load_bucket_cache)
+                cached = await asyncio.to_thread(load_bucket_cache, True)
             if token != self._load_token:
                 return
             has_cached = bool(cached)
@@ -2136,11 +2183,38 @@ class S3Browser(App):
                 self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
                     cached
                 )
-                self.path_input.placeholder = "Refreshing buckets..."
+                self.path_input.placeholder = "bucket/prefix/ (cached)"
                 self._render_bucket_nodes(cached)
+                if not force:
+                    overlay.update_detail(
+                        "Using cached buckets (config/credentials unchanged). Press 'r' to refresh."
+                    )
+                    overlay.update_progress(1, 1, "Cached")
+                    return
 
+            configured_profiles = list(getattr(self.service, "profiles", []))
+            if not configured_profiles:
+                configured_profiles = [None]
+            profile_total = max(1, len(configured_profiles))
             overlay.update_detail("Listing buckets across configured profiles...")
-            buckets, errors = await self.service.list_buckets_all()
+            overlay.update_progress(0, profile_total, "Profiles")
+
+            def on_list_progress(
+                completed: int,
+                total: int,
+                profile: Optional[str],
+                error: Optional[Exception],
+            ) -> None:
+                label = self._profile_label(profile)
+                suffix = " (error)" if error else ""
+                overlay.update_detail(
+                    f"Listed '{label}'{suffix} ({completed}/{max(1, total)})"
+                )
+                overlay.update_progress(completed, total, "Profiles")
+
+            buckets, errors = await self.service.list_buckets_all(
+                progress_callback=on_list_progress
+            )
             if errors:
                 retry_profiles: list[Optional[str]] = []
                 seen_profiles: set[str] = set()
@@ -2153,15 +2227,22 @@ class S3Browser(App):
                     seen_profiles.add(label)
                     retry_profiles.append(profile)
                 if retry_profiles:
+                    overlay.update_progress(0, len(retry_profiles), "SSO")
+                    reauthed = 0
                     for profile in retry_profiles:
                         overlay.update_detail(
                             f"SSO expired for '{self._profile_label(profile)}'. Re-authenticating..."
                         )
                         await self._reauth_sso_profile(profile)
+                        reauthed += 1
+                        overlay.update_progress(reauthed, len(retry_profiles), "SSO")
                     overlay.update_detail(
                         "Retrying bucket listing after SSO re-authentication..."
                     )
-                    buckets, errors = await self.service.list_buckets_all()
+                    overlay.update_progress(0, profile_total, "Profiles")
+                    buckets, errors = await self.service.list_buckets_all(
+                        progress_callback=on_list_progress
+                    )
             if token != self._load_token:
                 return
             self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
@@ -2175,16 +2256,50 @@ class S3Browser(App):
                 overlay.update_detail(
                     "Using cached profile and permission mapping..."
                 )
+                overlay.update_progress(1, 1, "Permissions")
                 buckets = cached_resolution
             else:
                 overlay.update_detail(
                     "Testing permissions to choose best profile per bucket..."
                 )
-                buckets = await self.service.select_best_bucket_profiles(buckets)
+                overlay.update_progress(0, 1, "Permissions")
+
+                def on_probe_progress(
+                    completed: int,
+                    total: int,
+                    bucket_name: str,
+                    profile: Optional[str],
+                ) -> None:
+                    profile_label = self._profile_label(profile)
+                    overlay.update_detail(
+                        f"Checking {bucket_name} [{profile_label}] ({completed}/{max(1, total)})"
+                    )
+                    overlay.update_progress(completed, total, "Permissions")
+
+                buckets = await self.service.select_best_bucket_profiles(
+                    buckets,
+                    progress_callback=on_probe_progress,
+                )
                 if token != self._load_token:
                     return
                 overlay.update_detail("Checking which buckets are empty...")
-                buckets = await self._resolve_bucket_empty_flags(buckets)
+                visible_count = len(
+                    [info for info in buckets if info.access != BUCKET_ACCESS_NO_VIEW]
+                )
+                overlay.update_progress(0, max(1, visible_count), "Empty")
+
+                def on_empty_progress(
+                    completed: int, total: int, bucket_name: str
+                ) -> None:
+                    overlay.update_detail(
+                        f"Checking empty status: {bucket_name} ({completed}/{max(1, total)})"
+                    )
+                    overlay.update_progress(completed, total, "Empty")
+
+                buckets = await self._resolve_bucket_empty_flags(
+                    buckets,
+                    progress_callback=on_empty_progress,
+                )
                 if token != self._load_token:
                     return
                 if buckets:
@@ -2212,6 +2327,8 @@ class S3Browser(App):
                 return
 
             self.path_input.placeholder = "bucket/prefix/"
+            overlay.update_detail("Rendering bucket list...")
+            overlay.update_progress(1, 1, "Finalize")
             self._render_bucket_nodes(buckets)
             if errors:
                 failed = ", ".join(
