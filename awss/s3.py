@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -110,6 +111,17 @@ class S3Service:
 
     def _default_config_path(self) -> Path:
         return self._config_base_dir() / "config.json"
+
+    def _aws_config_path(self) -> Path:
+        return Path.home() / ".aws" / "config"
+
+    def _aws_config_hash(self) -> Optional[str]:
+        path = self._aws_config_path()
+        try:
+            data = path.read_bytes()
+        except Exception:
+            return None
+        return hashlib.sha256(data).hexdigest()
 
     def _client(self, profile: Optional[str]):
         key = self._profile_key(profile)
@@ -400,16 +412,26 @@ class S3Service:
     def _decode_is_empty(self, value: object) -> bool:
         return bool(value)
 
-    def _read_bucket_cache(self) -> tuple[Optional[datetime], list[BucketInfo]]:
+    def _decode_cache_hash(self, value: object) -> Optional[str]:
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+        return None
+
+    def _read_bucket_cache(
+        self,
+    ) -> tuple[Optional[datetime], list[BucketInfo], Optional[str]]:
         try:
             payload = json.loads(self._bucket_cache_path.read_text())
         except Exception:
-            return None, []
+            return None, [], None
         if not isinstance(payload, dict):
-            return None, []
+            return None, [], None
         items = payload.get("buckets")
+        cache_hash = self._decode_cache_hash(payload.get("aws_config_sha256"))
         if not isinstance(items, list):
-            return self._parse_cache_saved_at(payload.get("saved_at")), []
+            return self._parse_cache_saved_at(payload.get("saved_at")), [], cache_hash
         buckets: list[BucketInfo] = []
         for item in items:
             if not isinstance(item, dict):
@@ -432,7 +454,7 @@ class S3Service:
                 )
             )
         saved_at = self._parse_cache_saved_at(payload.get("saved_at"))
-        return saved_at, buckets
+        return saved_at, buckets, cache_hash
 
     def load_cached_bucket_preferences(self) -> dict[str, Optional[str]]:
         buckets = self.load_bucket_cache()
@@ -442,8 +464,10 @@ class S3Service:
         return preferred
 
     def load_bucket_cache(self) -> list[BucketInfo]:
-        saved_at, buckets = self._read_bucket_cache()
+        saved_at, buckets, cache_hash = self._read_bucket_cache()
         if not buckets:
+            return []
+        if cache_hash != self._aws_config_hash():
             return []
         if self._bucket_cache_ttl_seconds <= 0:
             return buckets
@@ -469,6 +493,7 @@ class S3Service:
         ]
         payload = {
             "saved_at": datetime.now(timezone.utc).isoformat(),
+            "aws_config_sha256": self._aws_config_hash(),
             "buckets": rows,
         }
         try:

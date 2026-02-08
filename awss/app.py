@@ -1844,6 +1844,35 @@ class S3Browser(App):
                 values.append(bucket.profile)
         return candidates
 
+    def _reuse_cached_bucket_resolution(
+        self,
+        listed_buckets: list[BucketInfo],
+        cached_buckets: list[BucketInfo],
+    ) -> Optional[list[BucketInfo]]:
+        if not listed_buckets or not cached_buckets:
+            return None
+        listed_profiles: dict[str, set[Optional[str]]] = {}
+        for bucket in listed_buckets:
+            values = listed_profiles.setdefault(bucket.name, set())
+            values.add(bucket.profile)
+        cached_by_name = {bucket.name: bucket for bucket in cached_buckets}
+        if set(listed_profiles) != set(cached_by_name):
+            return None
+        resolved: list[BucketInfo] = []
+        for name, profiles in listed_profiles.items():
+            cached = cached_by_name[name]
+            if cached.profile not in profiles:
+                return None
+            resolved.append(
+                BucketInfo(
+                    name=name,
+                    profile=cached.profile,
+                    access=cached.access,
+                    is_empty=cached.is_empty,
+                )
+            )
+        return resolved
+
     async def _resolve_bucket_empty_flags(
         self, buckets: list[BucketInfo]
     ) -> list[BucketInfo]:
@@ -1969,20 +1998,30 @@ class S3Browser(App):
             self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
                 buckets
             )
+            cached_resolution: Optional[list[BucketInfo]] = None
+            if has_cached:
+                cached_resolution = self._reuse_cached_bucket_resolution(buckets, cached)
 
-            overlay.update_detail("Testing permissions to choose best profile per bucket...")
-            buckets = await self.service.select_best_bucket_profiles(buckets)
-            if token != self._load_token:
-                return
-            overlay.update_detail("Checking which buckets are empty...")
-            buckets = await self._resolve_bucket_empty_flags(buckets)
-            if token != self._load_token:
-                return
-
-            if buckets:
-                save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
-                if callable(save_bucket_cache):
-                    await asyncio.to_thread(save_bucket_cache, buckets)
+            if cached_resolution is not None:
+                overlay.update_detail(
+                    "Using cached profile and permission mapping..."
+                )
+                buckets = cached_resolution
+            else:
+                overlay.update_detail(
+                    "Testing permissions to choose best profile per bucket..."
+                )
+                buckets = await self.service.select_best_bucket_profiles(buckets)
+                if token != self._load_token:
+                    return
+                overlay.update_detail("Checking which buckets are empty...")
+                buckets = await self._resolve_bucket_empty_flags(buckets)
+                if token != self._load_token:
+                    return
+                if buckets:
+                    save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
+                    if callable(save_bucket_cache):
+                        await asyncio.to_thread(save_bucket_cache, buckets)
 
             if not buckets and has_cached and errors:
                 self.path_input.placeholder = "bucket/prefix/ (cached)"

@@ -175,6 +175,44 @@ class TestAppHelpers(unittest.TestCase):
             },
         )
 
+    def test_reuse_cached_bucket_resolution_when_bucket_set_and_profile_match(self) -> None:
+        app = S3Browser(profiles=["default", "dev", "prod"])
+        listed = [
+            BucketInfo(name="bucket-a", profile="dev"),
+            BucketInfo(name="bucket-a", profile="prod"),
+            BucketInfo(name="bucket-b", profile=None),
+        ]
+        cached = [
+            BucketInfo(
+                name="bucket-a",
+                profile="prod",
+                access=BUCKET_ACCESS_GOOD,
+                is_empty=False,
+            ),
+            BucketInfo(
+                name="bucket-b",
+                profile=None,
+                access=BUCKET_ACCESS_NO_DOWNLOAD,
+                is_empty=True,
+            ),
+        ]
+        resolved = app._reuse_cached_bucket_resolution(listed, cached)
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(
+            sorted((item.name, item.profile, item.access, item.is_empty) for item in resolved),
+            [
+                ("bucket-a", "prod", BUCKET_ACCESS_GOOD, False),
+                ("bucket-b", None, BUCKET_ACCESS_NO_DOWNLOAD, True),
+            ],
+        )
+
+    def test_reuse_cached_bucket_resolution_returns_none_on_profile_mismatch(self) -> None:
+        app = S3Browser(profiles=["default", "dev"])
+        listed = [BucketInfo(name="bucket-a", profile="dev")]
+        cached = [BucketInfo(name="bucket-a", profile="prod", access=BUCKET_ACCESS_GOOD)]
+        self.assertIsNone(app._reuse_cached_bucket_resolution(listed, cached))
+
     def test_call_with_sso_retry_reauthenticates_and_retries(self) -> None:
         app = S3Browser(profiles=["default"])
         app.notify = lambda *args, **kwargs: None  # type: ignore[assignment]

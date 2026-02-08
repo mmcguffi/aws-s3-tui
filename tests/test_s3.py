@@ -130,6 +130,22 @@ class TestS3Service(unittest.TestCase):
             self.assertTrue(service.save_bucket_cache(expected))
             self.assertEqual(service.load_bucket_cache(), expected)
 
+    def test_bucket_cache_invalidated_on_aws_config_hash_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "bucket-cache.json"
+            service = S3Service(
+                profiles=[None, "dev"],
+                cache_path=cache_path,
+                cache_ttl_seconds=3600,
+            )
+            service._aws_config_hash = lambda: "hash-one"  # type: ignore[method-assign]
+            expected = [
+                BucketInfo(name="alpha", profile=None, access=BUCKET_ACCESS_NO_VIEW),
+            ]
+            self.assertTrue(service.save_bucket_cache(expected))
+            service._aws_config_hash = lambda: "hash-two"  # type: ignore[method-assign]
+            self.assertEqual(service.load_bucket_cache(), [])
+
     def test_bucket_filter_state_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "bucket-cache.json"
