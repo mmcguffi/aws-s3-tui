@@ -78,6 +78,8 @@ class TestAppHelpers(unittest.TestCase):
         app.bucket_nodes[("dev", "bucket-a")] = object()
         self.assertIsNone(app._profile_for_bucket("missing"))
         self.assertEqual(app._profile_for_bucket("bucket-a"), "dev")
+        app.buckets = [BucketInfo(name="bucket-a", profile="prod")]
+        self.assertEqual(app._profile_for_bucket("bucket-a"), "prod")
 
     def test_resolve_input_path(self) -> None:
         app = S3Browser(profiles=["default"])

@@ -1390,10 +1390,38 @@ class S3Browser(App):
         current_node: object,
         new_access: Optional[str] = None,
     ) -> None:
-        if old_profile == new_profile:
-            return
         existing_access = self._bucket_access_for_name(bucket)
         chosen_access = new_access or existing_access
+        if old_profile == new_profile:
+            bucket_node = self.bucket_nodes.get((new_profile, bucket))
+            if bucket_node is not None:
+                try:
+                    bucket_node.data = NodeInfo(
+                        profile=new_profile, bucket=bucket, prefix=""
+                    )
+                except Exception:
+                    pass
+                try:
+                    label = self._bucket_label(
+                        BucketInfo(name=bucket, profile=new_profile, access=chosen_access)
+                    )
+                    bucket_node.set_label(label)
+                except Exception:
+                    pass
+            updated: list[BucketInfo] = []
+            for info in self.buckets:
+                if info.name == bucket:
+                    updated.append(
+                        BucketInfo(
+                            name=info.name,
+                            profile=info.profile,
+                            access=chosen_access,
+                        )
+                    )
+                else:
+                    updated.append(info)
+            self.buckets = updated
+            return
         old_bucket_key = (old_profile, bucket)
         bucket_node = self.bucket_nodes.get(old_bucket_key)
         if bucket_node is not None:
@@ -1468,11 +1496,13 @@ class S3Browser(App):
 
     async def _try_bucket_profile_fallback(
         self, info: NodeInfo, node: object
-    ) -> Optional[tuple[NodeInfo, list[str], list[ObjectInfo], bool]]:
+    ) -> tuple[Optional[tuple[NodeInfo, list[str], list[ObjectInfo], bool]], list[Optional[str]]]:
         candidates = self._profile_candidates_for_bucket(info.bucket)
+        attempted: list[Optional[str]] = []
         for profile in candidates:
             if profile == info.profile:
                 continue
+            attempted.append(profile)
             try:
                 prefixes, objects, has_any = await self.service.list_prefixes_and_objects(
                     profile, info.bucket, info.prefix
@@ -1502,10 +1532,21 @@ class S3Browser(App):
             save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
             if callable(save_bucket_cache):
                 await asyncio.to_thread(save_bucket_cache, self.buckets)
-            return new_info, prefixes, objects, has_any
-        return None
+            return (new_info, prefixes, objects, has_any), attempted
+        return None, attempted
 
     async def show_prefix(self, node, info: NodeInfo) -> None:
+        selected_profile = self._profile_for_bucket(info.bucket)
+        if selected_profile != info.profile:
+            info = NodeInfo(
+                profile=selected_profile,
+                bucket=info.bucket,
+                prefix=info.prefix,
+            )
+            try:
+                node.data = info
+            except Exception:
+                pass
         self.current_context = info
         self._preview_token += 1
         self._clear_selection()
@@ -1525,7 +1566,7 @@ class S3Browser(App):
                 info.profile, info.bucket, info.prefix
             )
         except Exception as exc:
-            fallback = await self._try_bucket_profile_fallback(info, node)
+            fallback, attempted = await self._try_bucket_profile_fallback(info, node)
             if fallback is not None:
                 info, prefixes, objects, has_any = fallback
             else:
@@ -1539,20 +1580,47 @@ class S3Browser(App):
                         self.s3_tree.select_node(self.s3_tree.root)
                     self.notify(f"{exc}", severity="error")
                     return
+                tried = [info.profile, *attempted]
+                tried_text = ", ".join(profile or "default" for profile in tried)
                 self._clear_table()
                 self._content_rows = [
-                    ("Access denied or unavailable", "", "", "", RowInfo(kind="error"))
+                    (
+                        f"Access denied or unavailable ({tried_text})",
+                        "",
+                        "",
+                        "",
+                        RowInfo(kind="error"),
+                    )
                 ]
                 self._active_filter = ""
                 self._add_row(
-                    "Access denied or unavailable",
+                    f"Access denied or unavailable ({tried_text})",
                     "",
                     "",
                     "",
                     RowInfo(kind="error"),
                 )
-                self.notify(f"{exc}", severity="error")
+                self.notify(f"Tried profiles: {tried_text}. {exc}", severity="error")
                 return
+
+        if self._bucket_access_for_name(info.bucket) == BUCKET_ACCESS_NO_VIEW:
+            access = BUCKET_ACCESS_NO_DOWNLOAD
+            bucket_access = getattr(self.service, "bucket_access", None)
+            if callable(bucket_access):
+                try:
+                    access = await bucket_access(info.profile, info.bucket)
+                except Exception:
+                    access = BUCKET_ACCESS_NO_DOWNLOAD
+            if access == BUCKET_ACCESS_NO_VIEW:
+                access = BUCKET_ACCESS_NO_DOWNLOAD
+            self._switch_bucket_profile(
+                info.bucket,
+                info.profile,
+                info.profile,
+                node,
+                new_access=access,
+            )
+
         if not has_any and info.prefix:
             if self._pending_target_node is node and self._pending_created:
                 prev_node = self._pending_prev_node
@@ -2385,12 +2453,12 @@ class S3Browser(App):
         self.s3_table.call_after_refresh(self._resize_table_columns)
 
     def _profile_for_bucket(self, bucket: str) -> Optional[str]:
-        for (profile, name), _node in self.bucket_nodes.items():
-            if name == bucket:
-                return profile
         for info in self.buckets:
             if info.name == bucket:
                 return info.profile
+        for (profile, name), _node in self.bucket_nodes.items():
+            if name == bucket:
+                return profile
         return None
 
     def _set_preview_text(self, text: str) -> None:
