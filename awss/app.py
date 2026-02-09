@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -36,6 +37,7 @@ from .s3 import (
     BUCKET_ACCESS_NO_VIEW,
     BUCKET_ACCESS_UNKNOWN,
 )
+from .gen_sso_profiles import main as generate_config_main
 
 
 @dataclass(frozen=True)
@@ -3753,8 +3755,7 @@ def _parse_profiles(args: argparse.Namespace) -> Optional[list[str]]:
     return profiles or None
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Textual S3 browser")
+def _add_browse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--profiles",
         help="Comma-separated AWS profiles to load (defaults to all available)",
@@ -3769,11 +3770,51 @@ def main() -> None:
         "--region",
         help="AWS region override for S3 client",
     )
-    args = parser.parse_args()
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(
+        prog="s3",
+        description="S3 browser and AWS SSO profile utilities",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    browse_parser = subparsers.add_parser(
+        "browse",
+        help="Launch the interactive S3 browser",
+    )
+    _add_browse_args(browse_parser)
+
+    generate_parser = subparsers.add_parser(
+        "generate-config",
+        help="Generate/merge AWS CLI SSO profiles and print config to stdout",
+    )
+    generate_parser.add_argument(
+        "--sso-session",
+        default=None,
+        help="Only generate profiles for this SSO session name",
+    )
+
+    commands = {"browse", "generate-config"}
+    if not args_list:
+        args_list = ["browse"]
+    elif args_list[0] not in commands and args_list[0] not in {"-h", "--help"}:
+        args_list = ["browse", *args_list]
+
+    args = parser.parse_args(args_list)
+
+    if args.command == "generate-config":
+        generate_args: list[str] = []
+        if args.sso_session:
+            generate_args.extend(["--sso-session", args.sso_session])
+        return int(generate_config_main(generate_args))
+
     profiles = _parse_profiles(args)
     app = S3Browser(profiles=profiles, region=args.region)
     app.run()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
