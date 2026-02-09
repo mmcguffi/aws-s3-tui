@@ -1,22 +1,41 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from time import monotonic
 from typing import Optional
 
+from rich.style import Style
+from rich.measure import Measurement
+from rich.segment import Segment
+from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual import events
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.widget import Widget
-from textual.widgets import Button, DataTable, Footer, Header, Input, Static, TextArea, Tree
-from rich.align import Align
-from rich.style import Style
-from rich.text import Text
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Static,
+    TextArea,
+    Tree,
+)
 
 from .s3 import BucketInfo, ObjectInfo, S3Service
+from .s3 import (
+    BUCKET_ACCESS_GOOD,
+    BUCKET_ACCESS_NO_DOWNLOAD,
+    BUCKET_ACCESS_NO_VIEW,
+    BUCKET_ACCESS_UNKNOWN,
+)
 
 
 @dataclass(frozen=True)
@@ -56,7 +75,9 @@ class DeepStats:
 
 
 class SplitHandle(Widget):
-    def __init__(self, orientation: str, before_id: str, after_id: str, **kwargs) -> None:
+    def __init__(
+        self, orientation: str, before_id: str, after_id: str, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self.orientation = orientation
         self.before_id = before_id
@@ -89,7 +110,11 @@ class SplitHandle(Widget):
     def on_mouse_move(self, event: events.MouseMove) -> None:
         if not self._dragging:
             return
-        delta = event.screen_x - self._start_pos if self.orientation == "vertical" else event.screen_y - self._start_pos
+        delta = (
+            event.screen_x - self._start_pos
+            if self.orientation == "vertical"
+            else event.screen_y - self._start_pos
+        )
         before, after = self._targets()
         if self.orientation == "vertical":
             min_before = 20
@@ -98,7 +123,9 @@ class SplitHandle(Widget):
             if total < min_before + min_after:
                 min_before = max(1, total // 2)
                 min_after = max(1, total - min_before)
-            new_before = max(min_before, min(total - min_after, self._start_before + delta))
+            new_before = max(
+                min_before, min(total - min_after, self._start_before + delta)
+            )
             new_after = total - new_before
             before.styles.width = new_before
             after.styles.width = new_after
@@ -109,7 +136,9 @@ class SplitHandle(Widget):
             if total < min_before + min_after:
                 min_before = max(1, total // 2)
                 min_after = max(1, total - min_before)
-            new_before = max(min_before, min(total - min_after, self._start_before + delta))
+            new_before = max(
+                min_before, min(total - min_after, self._start_before + delta)
+            )
             new_after = total - new_before
             before.styles.height = new_before
             after.styles.height = new_after
@@ -133,6 +162,17 @@ class SplitHandle(Widget):
         return "─"
 
 
+class S3Tree(Tree):
+    def on_key(self, event: events.Key) -> None:
+        if event.key != "right":
+            return
+        app = self.app
+        if not hasattr(app, "s3_table"):
+            return
+        app.set_focus(app.s3_table)
+        event.stop()
+
+
 class PreviewTable(DataTable):
     def _get_row_style(self, row_index: int, base_style: Style) -> Style:
         row_style = super()._get_row_style(row_index, base_style)
@@ -149,6 +189,33 @@ class PreviewTable(DataTable):
             selected_style = self.get_component_styles("datatable--cursor").rich_style
             return row_style + selected_style
         return row_style
+
+    def _render_cell(
+        self,
+        row_index: int,
+        column_index: int,
+        base_style: Style,
+        width: int,
+        cursor: bool = False,
+        hover: bool = False,
+    ):
+        lines = super()._render_cell(
+            row_index,
+            column_index,
+            base_style,
+            width,
+            cursor=cursor,
+            hover=hover,
+        )
+        padded: list[list[Segment]] = []
+        for line in lines:
+            if not line:
+                padded.append([Segment(" " * width, base_style)])
+                continue
+            style = line[-1].style or base_style
+            strip = Strip(line).adjust_cell_length(width, style)
+            padded.append(list(strip))
+        return padded
 
     async def on_click(self, event: events.Click) -> None:
         if event.button != 1:
@@ -171,11 +238,24 @@ class PreviewTable(DataTable):
                 return
             await self.app.preview_selected_row()
 
+    def action_cursor_left(self) -> None:
+        if hasattr(self.app, "s3_tree"):
+            self.app.set_focus(self.app.s3_tree)
+            return
+        super().action_cursor_left()
+
     def action_select_cursor(self) -> None:
+        info = self.app._row_info_for_cursor()
+        if info and info.kind in {"bucket", "prefix", "parent"}:
+            self.app.run_worker(self.app.open_selected_row())
+            return
         self.app.action_download()
 
 
 class DownloadDialog(ModalScreen[Optional[str]]):
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
     CSS = """
     DownloadDialog {
         align: center middle;
@@ -199,7 +279,27 @@ class DownloadDialog(ModalScreen[Optional[str]]):
         content-align: center middle;
         align: center middle;
         margin-top: 1;
-        height: 1;
+        height: auto;
+    }
+
+    .download-action {
+        width: auto;
+        height: auto;
+        align: center middle;
+        content-align: center middle;
+    }
+
+    .download-action-right {
+        margin-left: 2;
+    }
+
+    .download-hint {
+        width: 100%;
+        content-align: center middle;
+        text-align: center;
+        color: $text-muted;
+        text-style: dim;
+        text-opacity: 60%;
     }
 
     #download-info {
@@ -222,7 +322,10 @@ class DownloadDialog(ModalScreen[Optional[str]]):
     """
 
     def __init__(
-        self, default_path: str, label: str = "Download to:", info_lines: Optional[list[str]] = None
+        self,
+        default_path: str,
+        label: str = "Download to:",
+        info_lines: Optional[list[str]] = None,
     ) -> None:
         super().__init__()
         self._default_path = default_path
@@ -236,8 +339,12 @@ class DownloadDialog(ModalScreen[Optional[str]]):
             if self._info_lines:
                 yield Static("\n".join(self._info_lines), id="download-info")
             with Horizontal(id="download-actions"):
-                yield Button("Cancel", id="download-cancel", compact=True)
-                yield Button("Download", id="download-ok", compact=True)
+                with Vertical(classes="download-action"):
+                    yield Button("Cancel", id="download-cancel", compact=True)
+                    yield Static("Esc", classes="download-hint", markup=False)
+                with Vertical(classes="download-action download-action-right"):
+                    yield Button("Download", id="download-ok", compact=True)
+                    yield Static("Enter", classes="download-hint", markup=False)
 
     def on_mount(self) -> None:
         self.query_one("#download-path", Input).focus()
@@ -259,12 +366,167 @@ class DownloadDialog(ModalScreen[Optional[str]]):
             return
         self.dismiss(value)
 
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class RefreshOverlay(ModalScreen[None]):
+    BINDINGS = []
+
+    CSS = """
+    RefreshOverlay {
+        align: center middle;
+        background: $background 45%;
+    }
+
+    #refresh-overlay-box {
+        width: 56;
+        max-width: 80;
+        min-width: 34;
+        height: auto;
+        padding: 1 2;
+        border: round $panel;
+        background: $panel;
+        color: $text;
+    }
+
+    #refresh-overlay-title {
+        width: 100%;
+        text-style: bold;
+        content-align: center middle;
+    }
+
+    #refresh-overlay-detail {
+        width: 100%;
+        margin-top: 1;
+        color: $text-muted;
+        content-align: center middle;
+    }
+
+    #refresh-overlay-progress {
+        width: 100%;
+        margin-top: 1;
+        color: $text;
+        content-align: center middle;
+    }
+    """
+
+    def __init__(self, title: str, detail: str) -> None:
+        super().__init__()
+        self._title = title
+        self._detail = detail
+        self._progress = ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="refresh-overlay-box"):
+            yield Static(self._title, id="refresh-overlay-title")
+            yield Static(self._detail, id="refresh-overlay-detail", markup=False)
+            yield Static("", id="refresh-overlay-progress", markup=False)
+
+    def update_detail(self, detail: str) -> None:
+        self._detail = detail
+        if not self.is_mounted:
+            return
+        self.query_one("#refresh-overlay-detail", Static).update(detail)
+
+    def update_progress(self, completed: int, total: int, label: str = "") -> None:
+        safe_total = max(1, int(total))
+        safe_completed = max(0, min(int(completed), safe_total))
+        ratio = safe_completed / safe_total
+        width = 20
+        filled = int(ratio * width)
+        if safe_completed > 0 and filled == 0:
+            filled = 1
+        bar = "#" * filled + "-" * (width - filled)
+        percent = int(ratio * 100)
+        prefix = f"{label}: " if label else ""
+        self._progress = f"{prefix}[{bar}] {safe_completed}/{safe_total} ({percent}%)"
+        if not self.is_mounted:
+            return
+        self.query_one("#refresh-overlay-progress", Static).update(self._progress)
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key != "escape":
+            return
+        app = self.app
+        if hasattr(app, "action_confirm_quit"):
+            app.action_confirm_quit()
+        event.stop()
+
+
+PROFILE_DEFAULT_SENTINEL = "__default__"
+
+
+class ProfileSelectDialog(ModalScreen[Optional[str]]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    CSS = """
+    ProfileSelectDialog {
+        align: right top;
+        background: $background 0%;
+    }
+
+    #profile-dialog {
+        width: 28;
+        max-width: 40;
+        min-width: 18;
+        height: auto;
+        margin: 2 1 0 0;
+        padding: 1;
+        border: round $panel;
+        background: $panel;
+        color: $text;
+    }
+
+    #profile-title {
+        width: 100%;
+        content-align: left middle;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    .profile-option {
+        width: 100%;
+        content-align: left middle;
+        border: none;
+        background: transparent;
+        color: $text;
+    }
+    """
+
+    def __init__(
+        self, options: list[tuple[str, str]], current_value: Optional[str]
+    ) -> None:
+        super().__init__()
+        self._options = options
+        self._current_value = current_value
+        self._button_values: dict[str, str] = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="profile-dialog"):
+            yield Static("Choose profile", id="profile-title")
+            for index, (label, value) in enumerate(self._options):
+                marker = "• " if value == self._current_value else "  "
+                button_id = f"profile-option-{index}"
+                self._button_values[button_id] = value
+                yield Button(f"{marker}{label}", id=button_id, classes="profile-option")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        value = self._button_values.get(event.button.id or "")
+        if value is None:
+            return
+        self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
 
 ONE_MB = 1024**2
 HUNDRED_MB = 100 * ONE_MB
 ONE_GB = 1024**3
 TEN_GB = 10 * ONE_GB
 DEEP_SCAN_MAX_KEYS = 50000
+ESC_QUIT_WINDOW_SECONDS = 1.0
 
 
 def format_size(size: int) -> str:
@@ -291,10 +553,59 @@ def size_style(size: int) -> str:
     return "bold red"
 
 
-def size_cell(label: str, size: Optional[int]) -> str | Align:
+class EllipsisCell:
+    def __init__(
+        self,
+        label: str,
+        style: str | Style = "",
+        justify: str = "left",
+    ) -> None:
+        self.label = label or ""
+        self.style = style
+        self.justify = justify
+
+    def __rich_console__(self, console, options):
+        if not hasattr(options, "max_width"):
+            options = console.options
+        width = getattr(options, "max_width", None)
+        text = Text(
+            self.label, style=self.style, overflow="ellipsis", no_wrap=True, end=""
+        )
+        if width is None:
+            yield text
+            return
+        text.truncate(width, overflow="ellipsis")
+        padding = max(0, width - text.cell_len)
+        if self.justify == "right":
+            text.pad_left(padding)
+        elif self.justify == "center":
+            left = padding // 2
+            right = padding - left
+            if left:
+                text.pad_left(left)
+            if right:
+                text.pad_right(right)
+        else:
+            text.pad_right(padding)
+        yield text
+
+    def __rich_measure__(self, console, options) -> Measurement:
+        if not hasattr(options, "max_width"):
+            options = console.options
+        text = Text(self.label, style=self.style, end="")
+        return Measurement.get(console, options, text)
+
+
+def ellipsis_text(
+    label: str, style: str | Style = "", justify: str = "left"
+) -> EllipsisCell:
+    return EllipsisCell(label, style=style, justify=justify)
+
+
+def size_cell(label: str, size: Optional[int]) -> EllipsisCell:
     if not label or size is None:
-        return label
-    return Align.right(Text(label, style=size_style(size)))
+        return ellipsis_text(label)
+    return ellipsis_text(label, style=size_style(size), justify="right")
 
 
 def row_icon(info: RowInfo) -> str:
@@ -339,18 +650,63 @@ def modified_style(value: Optional[datetime]) -> str:
     return colors[index]
 
 
-def modified_cell(label: str, value: Optional[datetime]) -> str | Text:
+def modified_cell(label: str, value: Optional[datetime]) -> EllipsisCell:
     if not label or value is None:
-        return label
+        return ellipsis_text(label)
     style = modified_style(value)
     if not style:
-        return label
-    return Text(label, style=style)
+        return ellipsis_text(label)
+    return ellipsis_text(label, style=style)
 
 
 def display_segment(full_prefix: str, parent_prefix: str) -> str:
     name = full_prefix[len(parent_prefix) :] if parent_prefix else full_prefix
     return name.strip("/")
+
+
+def kind_for_row(info: RowInfo) -> str:
+    if info.kind in {"prefix", "bucket", "parent"}:
+        return "dir"
+    if info.kind != "object" or not info.key:
+        return ""
+    name = info.key.rsplit("/", 1)[-1]
+    return kind_from_name(name)
+
+
+def kind_from_name(name: str) -> str:
+    suffixes = PurePosixPath(name).suffixes
+    if suffixes and suffixes[-1].lower() == ".gz":
+        suffixes = suffixes[:-1]
+    if not suffixes:
+        return "file"
+    ext = suffixes[-1].lstrip(".").lower()
+    if not ext:
+        return "file"
+    mapping = {
+        "fa": "fasta",
+        "fna": "fasta",
+        "fasta": "fasta",
+        "ffn": "fasta",
+        "faa": "fasta",
+        "frn": "fasta",
+        "fq": "fastq",
+        "fastq": "fastq",
+        "bam": "bam",
+        "sam": "sam",
+        "cram": "cram",
+        "txt": "txt",
+        "csv": "csv",
+        "tsv": "tsv",
+        "json": "json",
+        "ndjson": "ndjson",
+        "parquet": "parquet",
+        "vcf": "vcf",
+        "bed": "bed",
+        "gff": "gff",
+        "gff3": "gff3",
+        "gtf": "gtf",
+    }
+    return mapping.get(ext, ext)
 
 
 class S3Browser(App):
@@ -370,6 +726,31 @@ class S3Browser(App):
         color: $text;
     }
 
+    #path-profile {
+        width: auto;
+        min-width: 6;
+        height: 1;
+        padding: 0 1;
+        margin-left: 1;
+        margin-right: 1;
+        content-align: center middle;
+        background: $panel;
+        color: $text-muted;
+        border: none;
+    }
+
+    #path-profile:hover {
+        background: $surface-lighten-1 20%;
+    }
+
+    #path-profile:focus {
+        background: $surface-lighten-1 30%;
+    }
+
+    #path-profile:disabled {
+        color: $text-muted 60%;
+    }
+
     #path-input {
         width: 1fr;
         height: 1;
@@ -383,9 +764,87 @@ class S3Browser(App):
         overflow-y: hidden;
     }
 
-    #s3-tree {
+    #left-pane {
         width: 35%;
         min-width: 24;
+        height: 1fr;
+        overflow-y: hidden;
+    }
+
+    #bucket-filters {
+        height: 3;
+        min-height: 3;
+        margin-top: 1;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: $text-muted;
+    }
+
+    #bucket-filter-label {
+        width: auto;
+        height: 1;
+        margin-right: 0;
+        color: $text-muted;
+        text-style: bold;
+    }
+
+    #bucket-filter-row {
+        width: 100%;
+        height: 1;
+    }
+
+    .bucket-filter {
+        height: 1;
+        width: auto;
+        min-width: 9;
+        margin-right: 1;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: $text-muted;
+        content-align: left middle;
+    }
+
+    .bucket-filter.active {
+        text-style: bold;
+    }
+
+    #bucket-filter-no-view {
+        color: #c97a7a;
+    }
+    #bucket-filter-no-view.active {
+        color: #ff9e9e;
+    }
+
+    #bucket-filter-no-download {
+        color: #d1a067;
+    }
+    #bucket-filter-no-download.active {
+        color: #ffc782;
+    }
+
+    #bucket-filter-empty {
+        color: #83afc7;
+    }
+    #bucket-filter-empty.active {
+        color: #9ed4f2;
+    }
+
+    #bucket-filter-favorites {
+        color: #c9b072;
+    }
+    #bucket-filter-favorites.active {
+        color: #ffe08d;
+    }
+
+    #bucket-filter-favorites {
+        margin-right: 0;
+    }
+
+    #s3-tree {
+        width: 1fr;
+        height: 1fr;
         border: round $panel;
     }
 
@@ -523,21 +982,26 @@ class S3Browser(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
+        ("escape", "confirm_quit", "Quit x2"),
         ("r", "refresh", "Refresh"),
         ("enter", "open", "Open"),
         ("backspace", "up", "Up"),
         ("alt+left", "back", "Back"),
         ("alt+right", "forward", "Forward"),
         ("ctrl+l", "focus_path", "Path"),
+        ("ctrl+f", "toggle_favorite", "Favorite"),
         ("space", "preview", "Preview"),
         ("m", "preview_more", "More/Scan"),
     ]
 
-    def __init__(self, profiles: Optional[list[str]] = None, region: Optional[str] = None) -> None:
+    def __init__(
+        self, profiles: Optional[list[str]] = None, region: Optional[str] = None
+    ) -> None:
         super().__init__()
         self.service = S3Service(profiles=profiles, region=region)
         self.buckets: list[BucketInfo] = []
         self.bucket_nodes: dict[tuple[Optional[str], str], object] = {}
+        self.bucket_profile_candidates: dict[str, list[Optional[str]]] = {}
         self.prefix_nodes: dict[tuple[Optional[str], str, str], object] = {}
         self.loaded_nodes: set[int] = set()
         self.current_context: Optional[NodeInfo] = None
@@ -546,7 +1010,7 @@ class S3Browser(App):
         self._load_token = 0
         self._content_token = 0
         self._canonical_path = "s3://"
-        self._content_rows: list[tuple[str, str, str, RowInfo]] = []
+        self._content_rows: list[tuple[str, str, str, str, RowInfo]] = []
         self._active_filter = ""
         self._pending_created: list[tuple[object, str, tuple]] = []
         self._pending_prev_node: Optional[object] = None
@@ -573,23 +1037,70 @@ class S3Browser(App):
         self._filter_input_value = ""
         self._col_icon = None
         self._col_name = None
+        self._col_kind = None
         self._col_size = None
         self._col_modified = None
+        self._quit_escape_deadline = 0.0
+        self._sso_reauth_inflight: dict[str, asyncio.Task[bool]] = {}
+        self._hide_no_view_buckets = False
+        self._hide_no_download_buckets = False
+        self._hide_empty_buckets = False
+        self._show_only_favorite_buckets = False
+        self._favorite_buckets: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="path-bar"):
             yield Static("s3://", id="path-prefix")
             yield Input(placeholder="bucket/prefix/", id="path-input")
+            yield Button("[-]", id="path-profile", compact=True)
             yield Button("←", id="nav-back", compact=True)
             yield Button("→", id="nav-forward", compact=True)
             yield Button("↓", id="download", compact=True)
         with Horizontal(id="body"):
-            yield Tree("", id="s3-tree")
-            yield SplitHandle("vertical", before_id="s3-tree", after_id="right-pane", classes="split-vertical")
+            with Vertical(id="left-pane"):
+                yield S3Tree("", id="s3-tree")
+                with Vertical(id="bucket-filters"):
+                    yield Static("Filters:", id="bucket-filter-label")
+                    with Horizontal(id="bucket-filter-row"):
+                        yield Button(
+                            "",
+                            id="bucket-filter-no-view",
+                            classes="bucket-filter",
+                            compact=True,
+                        )
+                        yield Button(
+                            "",
+                            id="bucket-filter-no-download",
+                            classes="bucket-filter",
+                            compact=True,
+                        )
+                        yield Button(
+                            "",
+                            id="bucket-filter-empty",
+                            classes="bucket-filter",
+                            compact=True,
+                        )
+                        yield Button(
+                            "",
+                            id="bucket-filter-favorites",
+                            classes="bucket-filter",
+                            compact=True,
+                        )
+            yield SplitHandle(
+                "vertical",
+                before_id="left-pane",
+                after_id="right-pane",
+                classes="split-vertical",
+            )
             with Vertical(id="right-pane"):
                 yield PreviewTable(id="s3-table")
-                yield SplitHandle("horizontal", before_id="s3-table", after_id="preview", classes="split-horizontal")
+                yield SplitHandle(
+                    "horizontal",
+                    before_id="s3-table",
+                    after_id="preview",
+                    classes="split-horizontal",
+                )
                 with Vertical(id="preview"):
                     yield Static("", id="preview-header")
                     yield TextArea(
@@ -610,6 +1121,7 @@ class S3Browser(App):
         self.s3_tree.show_root = False
         self.s3_table = self.query_one("#s3-table", DataTable)
         self.path_input = self.query_one("#path-input", Input)
+        self.path_profile = self.query_one("#path-profile", Button)
         self.nav_back = self.query_one("#nav-back", Button)
         self.nav_forward = self.query_one("#nav-forward", Button)
         self.download_button = self.query_one("#download", Button)
@@ -617,13 +1129,24 @@ class S3Browser(App):
         self.preview = self.query_one("#preview-content", TextArea)
         self.preview_status = self.query_one("#preview-status", Static)
         self.preview_more = self.query_one("#preview-more", Button)
-        self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
-        self._col_icon = self.s3_table.add_column("", width=2)
-        self._col_name, self._col_size, self._col_modified = self.s3_table.add_columns(
-            "Name",
-            "Size",
-            "Modified",
+        self.bucket_filter_no_view = self.query_one("#bucket-filter-no-view", Button)
+        self.bucket_filter_no_download = self.query_one(
+            "#bucket-filter-no-download", Button
         )
+        self.bucket_filter_empty = self.query_one("#bucket-filter-empty", Button)
+        self.bucket_filter_favorites = self.query_one("#bucket-filter-favorites", Button)
+        self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
+        self._set_profile_indicator(None)
+        await self._load_favorite_buckets()
+        await self._load_bucket_filter_state()
+        self._update_bucket_filter_buttons()
+        self._col_icon = self.s3_table.add_column("", width=2)
+        (
+            self._col_name,
+            self._col_kind,
+            self._col_size,
+            self._col_modified,
+        ) = self.s3_table.add_columns("Name", "Kind", "Size", "Modified")
         self._update_sort_headers()
         self.s3_table.cursor_type = "row"
         self.s3_table.zebra_stripes = True
@@ -631,7 +1154,118 @@ class S3Browser(App):
         self.set_focus(self.s3_tree)
         self._sync_nav_buttons()
         self._resize_table_columns()
-        await self.refresh_buckets()
+        self.run_worker(self._startup_refresh_flow(), exclusive=True)
+
+    async def _startup_refresh_flow(self) -> None:
+        await self._ensure_sso_logins()
+        await self.refresh_buckets(force=False)
+
+    async def _ensure_sso_logins(self) -> None:
+        if not hasattr(self.service, "sso_login_targets"):
+            return
+        try:
+            targets = self.service.sso_login_targets()
+        except Exception as exc:
+            self.notify(f"SSO preflight failed: {exc}", severity="warning")
+            return
+        for profile in targets:
+            self.notify(
+                f"SSO login required for profile '{profile}'. Opening browser...",
+                severity="warning",
+            )
+            await self._run_sso_login(profile)
+
+    async def _run_sso_login(self, profile: str) -> bool:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "aws",
+                "sso",
+                "login",
+                "--profile",
+                profile,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            self.notify(
+                "AWS CLI not found; cannot run `aws sso login`.", severity="error"
+            )
+            return False
+        stdout, stderr = await process.communicate()
+        if process.returncode == 0:
+            return True
+        message = stderr.decode("utf-8", errors="replace").strip()
+        if not message:
+            message = stdout.decode("utf-8", errors="replace").strip()
+        if not message:
+            message = f"aws sso login failed for profile '{profile}'."
+        self.notify(message, severity="error")
+        return False
+
+    def _profile_label(self, profile: Optional[str]) -> str:
+        return profile or "default"
+
+    def _is_sso_expired_error(self, exc: Exception) -> bool:
+        if exc is None:
+            return False
+        text = f"{type(exc).__name__}: {exc}".lower()
+        markers = [
+            "unauthorizedssotokenerror",
+            "sso session",
+            "sso token",
+            "token has expired",
+            "token is expired",
+            "expiredtoken",
+            "the sso session associated with this profile has expired",
+            "error loading sso token",
+            "run aws sso login",
+            "aws sso login",
+        ]
+        return any(marker in text for marker in markers)
+
+    async def _reauth_sso_profile(self, profile: Optional[str]) -> bool:
+        profile_name = self._profile_label(profile)
+        inflight = self._sso_reauth_inflight.get(profile_name)
+        if inflight is None:
+
+            async def do_login() -> bool:
+                self.notify(
+                    f"SSO token expired for '{profile_name}'. Running aws sso login...",
+                    severity="warning",
+                )
+                ok = await self._run_sso_login(profile_name)
+                if ok:
+                    self.notify(
+                        f"SSO login refreshed for '{profile_name}'.",
+                        severity="information",
+                    )
+                return ok
+
+            inflight = asyncio.create_task(do_login())
+            self._sso_reauth_inflight[profile_name] = inflight
+        try:
+            return await inflight
+        finally:
+            active = self._sso_reauth_inflight.get(profile_name)
+            if active is inflight and inflight.done():
+                self._sso_reauth_inflight.pop(profile_name, None)
+
+    async def _call_with_sso_retry(
+        self,
+        profile: Optional[str],
+        operation,
+        *args,
+        **kwargs,
+    ):
+        try:
+            return await operation(*args, **kwargs)
+        except Exception as exc:
+            if not self._is_sso_expired_error(exc):
+                raise
+            relogged = await self._reauth_sso_profile(profile)
+            if not relogged:
+                raise
+            return await operation(*args, **kwargs)
 
     def on_resize(self, event: events.Resize) -> None:
         self._resize_table_columns()
@@ -639,7 +1273,7 @@ class S3Browser(App):
     def _resize_table_columns(self) -> None:
         if not hasattr(self, "s3_table"):
             return
-        if not self._col_name:
+        if not self._col_name or not self._col_kind:
             return
         table = self.s3_table
         total_width = table.content_region.width
@@ -647,34 +1281,47 @@ class S3Browser(App):
             return
         padding = table.cell_padding
         icon_width = 2
+        kind_content = (
+            table.columns[self._col_kind].content_width if self._col_kind else 6
+        )
+        kind_base = max(4, min(kind_content, 8))
         size_base = max(
             10,
             table.columns[self._col_size].content_width if self._col_size else 10,
         )
         modified_base = max(
             16,
-            table.columns[self._col_modified].content_width if self._col_modified else 16,
+            table.columns[self._col_modified].content_width
+            if self._col_modified
+            else 16,
         )
         name_base = max(
             8,
             table.columns[self._col_name].content_width if self._col_name else 8,
         )
-        available_content = total_width - (2 * padding * 4)
+        available_content = total_width - (2 * padding * 5)
         if available_content <= 0:
             return
-        content_total = icon_width + size_base + modified_base + name_base
+        content_total = icon_width + size_base + modified_base + name_base + kind_base
         if content_total >= available_content:
-            name_width = max(1, available_content - (icon_width + size_base + modified_base))
+            name_width = max(
+                1,
+                available_content
+                - (icon_width + size_base + modified_base + kind_base),
+            )
             size_width = size_base
             modified_width = modified_base
+            kind_width = kind_base
         else:
             extra = available_content - content_total
-            name_cap = max(name_base, int(available_content * 0.6))
-            name_extra = min(extra, max(0, name_cap - name_base))
+            size_extra = int(extra * 0.08)
+            kind_extra = int(extra * 0.04)
+            modified_extra = int(extra * 0.2)
+            name_extra = extra - size_extra - kind_extra - modified_extra
+            size_width = size_base + size_extra
+            modified_width = modified_base + modified_extra
+            kind_width = kind_base + kind_extra
             name_width = name_base + name_extra
-            remaining = extra - name_extra
-            size_width = size_base
-            modified_width = modified_base + remaining
 
         def apply_width(column_key, width: int) -> None:
             column = table.columns.get(column_key)
@@ -684,14 +1331,342 @@ class S3Browser(App):
             column.auto_width = False
 
         apply_width(self._col_icon, icon_width)
+        apply_width(self._col_kind, kind_width)
         apply_width(self._col_size, size_width)
         apply_width(self._col_modified, modified_width)
         apply_width(self._col_name, name_width)
         table._require_update_dimensions = True
         table.refresh(layout=True)
 
-    async def action_refresh(self) -> None:
-        await self.refresh_buckets()
+    def _bucket_label(self, bucket: BucketInfo) -> Text:
+        profile_label = bucket.profile or "default"
+        style = self._bucket_name_style(bucket.access)
+        label = Text(bucket.name, style=style)
+        if self._is_bucket_favorite(bucket.name):
+            label.append(" ★", style="bold #ffd166")
+        label.append(f" [{profile_label}]", style="dim")
+        return label
+
+    def _bucket_name_style(self, access: str) -> str:
+        if access == BUCKET_ACCESS_NO_VIEW:
+            return "bold red"
+        if access == BUCKET_ACCESS_NO_DOWNLOAD:
+            return "bold #ff8c00"
+        if access == BUCKET_ACCESS_GOOD:
+            return "bold #2f80ed"
+        return "bold #2f80ed"
+
+    def _bucket_access_for_name(self, bucket: Optional[str]) -> str:
+        if not bucket:
+            return BUCKET_ACCESS_UNKNOWN
+        for info in self.buckets:
+            if info.name == bucket:
+                return info.access
+        return BUCKET_ACCESS_UNKNOWN
+
+    def _is_bucket_favorite(self, bucket: Optional[str]) -> bool:
+        if not bucket:
+            return False
+        return bucket in self._favorite_buckets
+
+    def _bucket_is_empty_for_name(self, bucket: Optional[str]) -> bool:
+        if not bucket:
+            return False
+        for info in self.buckets:
+            if info.name == bucket:
+                return bool(info.is_empty)
+        return False
+
+    def _set_profile_indicator(
+        self, profile: Optional[str], bucket: Optional[str] = None
+    ) -> None:
+        if not hasattr(self, "path_profile"):
+            return
+        if not bucket:
+            self.path_profile.label = Text("[-]")
+            self.path_profile.tooltip = None
+            self.path_profile.disabled = True
+            self.path_profile.styles.color = "#8a8a8a"
+            return
+        access = self._bucket_access_for_name(bucket)
+        profile_style = self._bucket_name_style(access).replace("bold ", "")
+        display, full = self._profile_indicator_parts(profile)
+        self.path_profile.disabled = False
+        self.path_profile.label = display
+        self.path_profile.tooltip = full
+        self.path_profile.styles.color = profile_style
+
+    def _profile_indicator_parts(
+        self, profile: Optional[str], max_profile_chars: int = 18
+    ) -> tuple[Text, str]:
+        profile_name = profile or "default"
+        full = f"[{profile_name}]"
+        limit = max(4, max_profile_chars)
+        if len(profile_name) > limit:
+            visible = f"{profile_name[: limit - 1]}…"
+        else:
+            visible = profile_name
+        return Text(f"[{visible}]"), full
+
+    def _bucket_filter_state_payload(self) -> dict[str, bool]:
+        return {
+            "hide_no_view": self._hide_no_view_buckets,
+            "hide_no_download": self._hide_no_download_buckets,
+            "hide_empty": self._hide_empty_buckets,
+            "only_favorites": self._show_only_favorite_buckets,
+        }
+
+    async def _load_favorite_buckets(self) -> None:
+        load_favorite_buckets = getattr(self.service, "load_favorite_buckets", None)
+        if not callable(load_favorite_buckets):
+            return
+        try:
+            favorites = await asyncio.to_thread(load_favorite_buckets)
+        except Exception:
+            return
+        if isinstance(favorites, set):
+            self._favorite_buckets = {name for name in favorites if isinstance(name, str)}
+            return
+        if isinstance(favorites, list):
+            self._favorite_buckets = {
+                str(name).strip()
+                for name in favorites
+                if isinstance(name, str) and name.strip()
+            }
+
+    async def _save_favorite_buckets(self) -> None:
+        save_favorite_buckets = getattr(self.service, "save_favorite_buckets", None)
+        if not callable(save_favorite_buckets):
+            return
+        try:
+            await asyncio.to_thread(save_favorite_buckets, self._favorite_buckets)
+        except Exception:
+            return
+
+    async def _load_bucket_filter_state(self) -> None:
+        load_bucket_filter_state = getattr(self.service, "load_bucket_filter_state", None)
+        if not callable(load_bucket_filter_state):
+            return
+        try:
+            state = await asyncio.to_thread(load_bucket_filter_state)
+        except Exception:
+            return
+        if not isinstance(state, dict):
+            return
+        self._hide_no_view_buckets = bool(state.get("hide_no_view", False))
+        self._hide_no_download_buckets = bool(state.get("hide_no_download", False))
+        self._hide_empty_buckets = bool(state.get("hide_empty", False))
+        self._show_only_favorite_buckets = bool(state.get("only_favorites", False))
+
+    async def _save_bucket_filter_state(self) -> None:
+        save_bucket_filter_state = getattr(self.service, "save_bucket_filter_state", None)
+        if not callable(save_bucket_filter_state):
+            return
+        state = self._bucket_filter_state_payload()
+        try:
+            await asyncio.to_thread(save_bucket_filter_state, state)
+        except Exception:
+            return
+
+    def _bucket_filter_button_label(self, checked: bool, label: str) -> Text:
+        marker = "[x]" if checked else "[ ]"
+        return Text(f"{marker} {label}")
+
+    def _set_filter_button_state(self, button: Button, checked: bool) -> None:
+        if checked:
+            button.add_class("active")
+        else:
+            button.remove_class("active")
+
+    def _update_bucket_filter_buttons(self) -> None:
+        if not hasattr(self, "bucket_filter_no_view"):
+            return
+        self.bucket_filter_no_view.label = self._bucket_filter_button_label(
+            self._hide_no_view_buckets, "NoView"
+        )
+        self._set_filter_button_state(
+            self.bucket_filter_no_view, self._hide_no_view_buckets
+        )
+        self.bucket_filter_no_download.label = self._bucket_filter_button_label(
+            self._hide_no_download_buckets, "NoDL"
+        )
+        self._set_filter_button_state(
+            self.bucket_filter_no_download, self._hide_no_download_buckets
+        )
+        self.bucket_filter_empty.label = self._bucket_filter_button_label(
+            self._hide_empty_buckets, "Empty"
+        )
+        self._set_filter_button_state(
+            self.bucket_filter_empty, self._hide_empty_buckets
+        )
+        self.bucket_filter_favorites.label = self._bucket_filter_button_label(
+            self._show_only_favorite_buckets, "Favs"
+        )
+        self._set_filter_button_state(
+            self.bucket_filter_favorites, self._show_only_favorite_buckets
+        )
+
+    def _bucket_hidden_by_filter(self, bucket: BucketInfo) -> bool:
+        if self._hide_no_view_buckets and bucket.access == BUCKET_ACCESS_NO_VIEW:
+            return True
+        if (
+            self._hide_no_download_buckets
+            and bucket.access == BUCKET_ACCESS_NO_DOWNLOAD
+        ):
+            return True
+        if self._hide_empty_buckets and bucket.is_empty:
+            return True
+        if self._show_only_favorite_buckets and not self._is_bucket_favorite(bucket.name):
+            return True
+        return False
+
+    def _visible_buckets(self) -> list[BucketInfo]:
+        return [bucket for bucket in self.buckets if not self._bucket_hidden_by_filter(bucket)]
+
+    async def _toggle_bucket_filter(self, filter_name: str) -> None:
+        if filter_name == "hide_no_view":
+            self._hide_no_view_buckets = not self._hide_no_view_buckets
+        elif filter_name == "hide_no_download":
+            self._hide_no_download_buckets = not self._hide_no_download_buckets
+        elif filter_name == "hide_empty":
+            self._hide_empty_buckets = not self._hide_empty_buckets
+        elif filter_name == "only_favorites":
+            self._show_only_favorite_buckets = not self._show_only_favorite_buckets
+        else:
+            return
+        self._update_bucket_filter_buttons()
+        await self._save_bucket_filter_state()
+        self._refresh_after_bucket_visibility_change()
+
+    def _selected_bucket_for_toggle(self) -> Optional[str]:
+        if self.current_context and self.current_context.bucket:
+            return self.current_context.bucket
+        node = getattr(self.s3_tree, "cursor_node", None)
+        data = getattr(node, "data", None)
+        if isinstance(data, NodeInfo):
+            return data.bucket
+        info = self._row_info_for_cursor()
+        if info and info.kind == "bucket" and info.bucket:
+            return info.bucket
+        return None
+
+    def action_toggle_favorite(self) -> None:
+        self.run_worker(self._toggle_favorite_flow(), exclusive=True)
+
+    async def _toggle_favorite_flow(self) -> None:
+        bucket = self._selected_bucket_for_toggle()
+        if not bucket:
+            self.notify("Select a bucket to favorite.", severity="warning")
+            return
+        if bucket in self._favorite_buckets:
+            self._favorite_buckets.remove(bucket)
+            message = f"Removed favorite: {bucket}"
+        else:
+            self._favorite_buckets.add(bucket)
+            message = f"Favorited: {bucket}"
+        await self._save_favorite_buckets()
+        self._refresh_after_bucket_visibility_change()
+        self.notify(message, severity="information")
+
+    def _refresh_after_bucket_visibility_change(self) -> None:
+        current = self.current_context
+        visible_names = {bucket.name for bucket in self._visible_buckets()}
+        self._render_bucket_nodes(self.buckets)
+        if current and current.bucket in visible_names:
+            profile = self._profile_for_bucket(current.bucket)
+            if profile is None:
+                profile = current.profile
+            self.navigate_to(profile, current.bucket, current.prefix)
+            return
+        self.current_context = None
+        self.show_bucket_list()
+
+    def _bucket_access_level(self, access: str) -> int:
+        if access == BUCKET_ACCESS_GOOD:
+            return 2
+        if access == BUCKET_ACCESS_NO_DOWNLOAD:
+            return 1
+        return 0
+
+    async def _resolve_profile_for_bucket_access(
+        self, bucket: str, current_profile: Optional[str]
+    ) -> tuple[Optional[str], str]:
+        bucket_access = getattr(self.service, "bucket_access", None)
+        if not callable(bucket_access):
+            return current_profile, self._bucket_access_for_name(bucket)
+
+        candidates = self._profile_candidates_for_bucket(bucket)
+        if current_profile not in candidates:
+            candidates.insert(0, current_profile)
+        candidates = [profile for profile in candidates if profile is not None] + (
+            [None] if None in candidates else []
+        )
+
+        profile_order: dict[Optional[str], int] = {}
+        if hasattr(self.service, "profiles"):
+            profile_order = {
+                profile: index for index, profile in enumerate(getattr(self.service, "profiles"))
+            }
+
+        async def probe_access(profile: Optional[str]) -> str:
+            try:
+                result = await self._call_with_sso_retry(
+                    profile,
+                    bucket_access,
+                    profile,
+                    bucket,
+                )
+            except Exception:
+                return BUCKET_ACCESS_NO_VIEW
+            if not isinstance(result, str):
+                return BUCKET_ACCESS_NO_VIEW
+            normalized = result.strip().lower()
+            if normalized in {
+                BUCKET_ACCESS_GOOD,
+                BUCKET_ACCESS_NO_DOWNLOAD,
+                BUCKET_ACCESS_NO_VIEW,
+            }:
+                return normalized
+            return BUCKET_ACCESS_NO_VIEW
+
+        checks = [probe_access(profile) for profile in candidates]
+        results = await asyncio.gather(*checks)
+
+        best_profile = current_profile
+        best_access = self._bucket_access_for_name(bucket)
+        best_key = (
+            self._bucket_access_level(best_access),
+            1 if best_profile is not None else 0,
+            -profile_order.get(best_profile, len(profile_order)),
+        )
+
+        for profile, access in zip(candidates, results):
+            key = (
+                self._bucket_access_level(access),
+                1 if profile is not None else 0,
+                -profile_order.get(profile, len(profile_order)),
+            )
+            if key > best_key:
+                best_key = key
+                best_profile = profile
+                best_access = access
+
+        return best_profile, best_access
+
+    def action_refresh(self) -> None:
+        self.run_worker(self.refresh_buckets(force=True), exclusive=True)
+
+    def action_confirm_quit(self) -> None:
+        now = monotonic()
+        if now <= self._quit_escape_deadline:
+            self._quit_escape_deadline = 0.0
+            self.exit()
+            return
+        self._quit_escape_deadline = now + ESC_QUIT_WINDOW_SECONDS
+        self.notify(
+            "Press Esc again within 1 second to quit.",
+            severity="warning",
+        )
 
     async def action_open(self) -> None:
         if self.focused is self.s3_table:
@@ -715,11 +1690,17 @@ class S3Browser(App):
         if not selected:
             row_key = self._row_key_for_cursor()
             if row_key is None:
-                self.notify("Select a file to download.", severity="warning")
+                self.notify("Select a file or folder to download.", severity="warning")
                 return
             info = self._row_info.get(row_key)
-            if not info or info.kind != "object" or not info.key or not info.bucket:
-                self.notify("Select a file to download.", severity="warning")
+            if not info:
+                self.notify("Select a file or folder to download.", severity="warning")
+                return
+            if info.kind == "prefix":
+                await self._download_prefix(info)
+                return
+            if info.kind != "object" or not info.key or not info.bucket:
+                self.notify("Select a file or folder to download.", severity="warning")
                 return
             selected = [info]
 
@@ -727,7 +1708,9 @@ class S3Browser(App):
             default_dir = str(Path.home() / "Downloads")
             info_lines = self._download_info_lines(selected)
             target = await self.push_screen_wait(
-                DownloadDialog(default_dir, label="Download directory:", info_lines=info_lines)
+                DownloadDialog(
+                    default_dir, label="Download directory:", info_lines=info_lines
+                )
             )
             if not target:
                 return
@@ -736,8 +1719,13 @@ class S3Browser(App):
             try:
                 for info in selected:
                     destination = str(directory / (Path(info.key).name or "download"))
-                    await self.service.download_object(
-                        info.profile, info.bucket, info.key, destination
+                    await self._call_with_sso_retry(
+                        info.profile,
+                        self.service.download_object,
+                        info.profile,
+                        info.bucket,
+                        info.key,
+                        destination,
                     )
             except Exception as exc:
                 self.notify(f"{exc}", severity="error")
@@ -748,22 +1736,90 @@ class S3Browser(App):
         info = selected[0]
         default_name = str(Path.home() / (Path(info.key).name or "download"))
         info_lines = self._download_info_lines([info])
-        target = await self.push_screen_wait(DownloadDialog(default_name, info_lines=info_lines))
+        target = await self.push_screen_wait(
+            DownloadDialog(default_name, info_lines=info_lines)
+        )
         if not target:
             return
         destination = self._resolve_download_path(target, info)
         self.notify("Downloading...", severity="information")
         try:
-            await self.service.download_object(
-                info.profile, info.bucket, info.key, destination
+            await self._call_with_sso_retry(
+                info.profile,
+                self.service.download_object,
+                info.profile,
+                info.bucket,
+                info.key,
+                destination,
             )
         except Exception as exc:
             self.notify(f"{exc}", severity="error")
             return
         self.notify(f"Downloaded to {destination}", severity="information")
 
+    async def _download_prefix(self, info: RowInfo) -> None:
+        if not info.bucket or info.prefix is None:
+            self.notify("Select a folder to download.", severity="warning")
+            return
+        default_dir = str(
+            Path.home() / "Downloads" / self._prefix_download_name(info)
+        )
+        info_lines = self._download_prefix_info_lines(info)
+        target = await self.push_screen_wait(
+            DownloadDialog(
+                default_dir, label="Download folder to:", info_lines=info_lines
+            )
+        )
+        if not target:
+            return
+        target_dir = self._resolve_prefix_download_dir(target, info)
+        self.notify("Listing files...", severity="information")
+        try:
+            objects = await self._call_with_sso_retry(
+                info.profile,
+                self.service.list_objects_recursive,
+                info.profile,
+                info.bucket,
+                info.prefix,
+            )
+        except Exception as exc:
+            self.notify(f"{exc}", severity="error")
+            return
+        if not objects:
+            self.notify("No files to download.", severity="warning")
+            return
+        self.notify(
+            f"Downloading {len(objects)} files...", severity="information"
+        )
+        base_prefix = info.prefix or ""
+        if base_prefix and not base_prefix.endswith("/"):
+            base_prefix = f"{base_prefix}/"
+        try:
+            for obj in objects:
+                if base_prefix and obj.key.startswith(base_prefix):
+                    relative = obj.key[len(base_prefix) :]
+                else:
+                    relative = obj.key
+                destination = str(target_dir / relative)
+                await self._call_with_sso_retry(
+                    info.profile,
+                    self.service.download_object,
+                    info.profile,
+                    info.bucket,
+                    obj.key,
+                    destination,
+                )
+        except Exception as exc:
+            self.notify(f"{exc}", severity="error")
+            return
+        self.notify(f"Downloaded to {target_dir}", severity="information")
+
     async def action_preview_more(self) -> None:
-        if self._preview_stats_info and self._preview_stats_shallow and self._preview_stats_deep is None:
+        if (
+            self._preview_stats_info
+            and self._preview_stats_shallow
+            and self._preview_stats_deep is None
+        ):
             if self.preview_more.disabled:
                 return
             await self._load_deep_prefix_stats()
@@ -775,6 +1831,21 @@ class S3Browser(App):
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "preview-more":
             await self.action_preview_more()
+            return
+        if event.button.id == "bucket-filter-no-view":
+            await self._toggle_bucket_filter("hide_no_view")
+            return
+        if event.button.id == "bucket-filter-no-download":
+            await self._toggle_bucket_filter("hide_no_download")
+            return
+        if event.button.id == "bucket-filter-empty":
+            await self._toggle_bucket_filter("hide_empty")
+            return
+        if event.button.id == "bucket-filter-favorites":
+            await self._toggle_bucket_filter("only_favorites")
+            return
+        if event.button.id == "path-profile":
+            self.action_choose_profile()
             return
         if event.button.id == "nav-back":
             self.action_back()
@@ -790,6 +1861,92 @@ class S3Browser(App):
         self.set_focus(self.path_input)
         if hasattr(self.path_input, "select_all"):
             self.path_input.select_all()
+
+    def action_choose_profile(self) -> None:
+        self.run_worker(self._choose_profile_flow(), exclusive=True)
+
+    async def _choose_profile_flow(self) -> None:
+        if not self.current_context or not self.current_context.bucket:
+            self.notify("Open a bucket to choose profile.", severity="warning")
+            return
+        bucket = self.current_context.bucket
+        current_profile = self._profile_for_bucket(bucket)
+        options: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for profile in self._profile_candidates_for_bucket(bucket):
+            value = PROFILE_DEFAULT_SENTINEL if profile is None else profile
+            if value in seen:
+                continue
+            seen.add(value)
+            label = profile or "default"
+            options.append((label, value))
+        if not options:
+            self.notify("No profiles available.", severity="warning")
+            return
+        current_value = (
+            PROFILE_DEFAULT_SENTINEL if current_profile is None else current_profile
+        )
+        selected = await self.push_screen_wait(
+            ProfileSelectDialog(options, current_value=current_value)
+        )
+        if not selected:
+            return
+        profile = None if selected == PROFILE_DEFAULT_SENTINEL else selected
+        if profile == current_profile:
+            return
+
+        access = self._bucket_access_for_name(bucket)
+        bucket_access = getattr(self.service, "bucket_access", None)
+        if callable(bucket_access):
+            try:
+                access = await self._call_with_sso_retry(
+                    profile,
+                    bucket_access,
+                    profile,
+                    bucket,
+                )
+            except Exception:
+                access = BUCKET_ACCESS_NO_VIEW
+
+        node = self.s3_tree.cursor_node
+        if node is None:
+            node = self.bucket_nodes.get((current_profile, bucket))
+        if node is None:
+            for (_profile, name), candidate in self.bucket_nodes.items():
+                if name == bucket:
+                    node = candidate
+                    break
+
+        if node is not None:
+            self._switch_bucket_profile(
+                bucket,
+                current_profile,
+                profile,
+                node,
+                new_access=access,
+            )
+        else:
+            updated: list[BucketInfo] = []
+            for info in self.buckets:
+                if info.name == bucket:
+                    updated.append(
+                        BucketInfo(
+                            name=info.name,
+                            profile=profile,
+                            access=access,
+                            is_empty=info.is_empty,
+                        )
+                    )
+                else:
+                    updated.append(info)
+            self.buckets = updated
+
+        save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
+        if callable(save_bucket_cache):
+            await asyncio.to_thread(save_bucket_cache, self.buckets)
+
+        self._set_profile_indicator(profile, bucket)
+        self.navigate_to(profile, bucket, self.current_context.prefix)
 
     def action_back(self) -> None:
         if self._history_index <= 0:
@@ -814,7 +1971,9 @@ class S3Browser(App):
             self.s3_tree.select_node(self.s3_tree.root)
             return
         parent_prefix = self._parent_prefix(self.current_context.prefix)
-        self.navigate_to(self.current_context.profile, self.current_context.bucket, parent_prefix)
+        self.navigate_to(
+            self.current_context.profile, self.current_context.bucket, parent_prefix
+        )
 
     async def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
         node = event.node
@@ -843,6 +2002,7 @@ class S3Browser(App):
             return
         sort_map = {
             self._col_name: "name",
+            self._col_kind: "kind",
             self._col_size: "size",
             self._col_modified: "modified",
         }
@@ -868,7 +2028,13 @@ class S3Browser(App):
             return
         info: NodeInfo = node.data
         try:
-            prefixes = await self.service.list_prefixes(info.profile, info.bucket, info.prefix)
+            prefixes = await self._call_with_sso_retry(
+                info.profile,
+                self.service.list_prefixes,
+                info.profile,
+                info.bucket,
+                info.prefix,
+            )
         except Exception as exc:
             node.allow_expand = False
             self.notify(f"{exc}", severity="error")
@@ -876,11 +2042,133 @@ class S3Browser(App):
         self.loaded_nodes.add(node.id)
         self._sync_prefix_children(node, info, prefixes)
 
-    async def refresh_buckets(self) -> None:
-        self._load_token += 1
-        token = self._load_token
+    def _collect_bucket_profile_candidates(
+        self, buckets: list[BucketInfo]
+    ) -> dict[str, list[Optional[str]]]:
+        candidates: dict[str, list[Optional[str]]] = {}
+        for bucket in buckets:
+            values = candidates.setdefault(bucket.name, [])
+            if bucket.profile not in values:
+                values.append(bucket.profile)
+        return candidates
+
+    def _reuse_cached_bucket_resolution(
+        self,
+        listed_buckets: list[BucketInfo],
+        cached_buckets: list[BucketInfo],
+    ) -> Optional[list[BucketInfo]]:
+        if not listed_buckets or not cached_buckets:
+            return None
+        listed_profiles: dict[str, set[Optional[str]]] = {}
+        for bucket in listed_buckets:
+            values = listed_profiles.setdefault(bucket.name, set())
+            values.add(bucket.profile)
+        cached_by_name = {bucket.name: bucket for bucket in cached_buckets}
+        if set(listed_profiles) != set(cached_by_name):
+            return None
+        resolved: list[BucketInfo] = []
+        for name, profiles in listed_profiles.items():
+            cached = cached_by_name[name]
+            if cached.profile not in profiles:
+                return None
+            resolved.append(
+                BucketInfo(
+                    name=name,
+                    profile=cached.profile,
+                    access=cached.access,
+                    is_empty=cached.is_empty,
+                )
+            )
+        return resolved
+
+    async def _resolve_bucket_empty_flags(
+        self,
+        buckets: list[BucketInfo],
+        progress_callback=None,
+    ) -> list[BucketInfo]:
+        is_bucket_empty = getattr(self.service, "is_bucket_empty", None)
+        if not callable(is_bucket_empty):
+            return buckets
+        checks: list[asyncio.Task[tuple[int, BucketInfo, object]]] = []
+
+        async def run_check(
+            index: int, bucket_info: BucketInfo
+        ) -> tuple[int, BucketInfo, object]:
+            try:
+                result = await self._call_with_sso_retry(
+                    bucket_info.profile,
+                    is_bucket_empty,
+                    bucket_info.profile,
+                    bucket_info.name,
+                )
+            except Exception as exc:
+                return index, bucket_info, exc
+            return index, bucket_info, result
+
+        for index, bucket in enumerate(buckets):
+            if bucket.access == BUCKET_ACCESS_NO_VIEW:
+                continue
+            checks.append(asyncio.create_task(run_check(index, bucket)))
+        if not checks:
+            return buckets
+
+        total = len(checks)
+        completed = 0
+        resolved_by_index: dict[int, bool] = {}
+        for task in asyncio.as_completed(checks):
+            index, bucket, result = await task
+            completed += 1
+            if callable(progress_callback):
+                try:
+                    progress_callback(completed, total, bucket.name)
+                except Exception:
+                    pass
+            resolved_by_index[index] = result if isinstance(result, bool) else False
+
+        resolved = list(buckets)
+        for index, is_empty in resolved_by_index.items():
+            bucket = resolved[index]
+            resolved[index] = BucketInfo(
+                name=bucket.name,
+                profile=bucket.profile,
+                access=bucket.access,
+                is_empty=is_empty,
+            )
+        return resolved
+
+    def _render_bucket_nodes(self, buckets: list[BucketInfo]) -> None:
         self.s3_tree.clear()
         self.bucket_nodes.clear()
+        self.prefix_nodes.clear()
+        self.loaded_nodes.clear()
+        self.buckets = sorted(buckets, key=lambda b: b.name.lower())
+        for bucket in self.buckets:
+            values = self.bucket_profile_candidates.setdefault(bucket.name, [])
+            if bucket.profile not in values:
+                values.append(bucket.profile)
+        for bucket in self._visible_buckets():
+            node = self.s3_tree.root.add(
+                self._bucket_label(bucket),
+                data=NodeInfo(profile=bucket.profile, bucket=bucket.name, prefix=""),
+                allow_expand=True,
+            )
+            self.bucket_nodes[(bucket.profile, bucket.name)] = node
+        self.s3_tree.root.expand()
+        self.s3_tree.select_node(self.s3_tree.root)
+
+    async def refresh_buckets(self, force: bool = False) -> None:
+        self._load_token += 1
+        token = self._load_token
+        overlay = RefreshOverlay(
+            "Refreshing Buckets",
+            "Listing buckets across configured profiles...",
+        )
+        await self.push_screen(overlay)
+        overlay.update_progress(0, 1, "Init")
+        await asyncio.sleep(0)
+        self.s3_tree.clear()
+        self.bucket_nodes.clear()
+        self.bucket_profile_candidates.clear()
         self.prefix_nodes.clear()
         self.loaded_nodes.clear()
         self.current_context = None
@@ -894,27 +2182,441 @@ class S3Browser(App):
         self._suppress_history_once = False
         self._sync_nav_buttons()
         self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
+        self._set_profile_indicator(None)
         self.path_input.placeholder = "Loading buckets..."
         self.s3_tree.root.expand()
-        buckets, errors = await self.service.list_buckets_all()
-        if token != self._load_token:
-            return
-        self.path_input.placeholder = "bucket/prefix/"
-        self.buckets = sorted(buckets, key=lambda b: b.name.lower())
-        if errors:
-            self.notify("Some credentials could not list buckets.", severity="warning")
-        for bucket in self.buckets:
-            node = self.s3_tree.root.add(
-                Text(bucket.name, style="bold cyan"),
-                data=NodeInfo(profile=bucket.profile, bucket=bucket.name, prefix=""),
-                allow_expand=True,
+        try:
+            cached: list[BucketInfo] = []
+            load_bucket_cache = getattr(self.service, "load_bucket_cache", None)
+            if callable(load_bucket_cache):
+                cached = await asyncio.to_thread(load_bucket_cache, True)
+            if token != self._load_token:
+                return
+            has_cached = bool(cached)
+            if has_cached:
+                self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
+                    cached
+                )
+                self.path_input.placeholder = "bucket/prefix/ (cached)"
+                self._render_bucket_nodes(cached)
+                if not force:
+                    overlay.update_detail(
+                        "Using cached buckets (config/credentials unchanged). Press 'r' to refresh."
+                    )
+                    overlay.update_progress(1, 1, "Cached")
+                    return
+
+            configured_profiles = list(getattr(self.service, "profiles", []))
+            if not configured_profiles:
+                configured_profiles = [None]
+            profile_total = max(1, len(configured_profiles))
+            overlay.update_detail("Listing buckets across configured profiles...")
+            overlay.update_progress(0, profile_total, "Profiles")
+
+            def on_list_progress(
+                completed: int,
+                total: int,
+                profile: Optional[str],
+                error: Optional[Exception],
+            ) -> None:
+                label = self._profile_label(profile)
+                suffix = " (error)" if error else ""
+                overlay.update_detail(
+                    f"Listed '{label}'{suffix} ({completed}/{max(1, total)})"
+                )
+                overlay.update_progress(completed, total, "Profiles")
+
+            buckets, errors = await self.service.list_buckets_all(
+                progress_callback=on_list_progress
             )
-            self.bucket_nodes[(bucket.profile, bucket.name)] = node
-        self.s3_tree.root.expand()
-        self.s3_tree.select_node(self.s3_tree.root)
+            if errors:
+                retry_profiles: list[Optional[str]] = []
+                seen_profiles: set[str] = set()
+                for profile, error in errors:
+                    if not self._is_sso_expired_error(error):
+                        continue
+                    label = self._profile_label(profile)
+                    if label in seen_profiles:
+                        continue
+                    seen_profiles.add(label)
+                    retry_profiles.append(profile)
+                if retry_profiles:
+                    overlay.update_progress(0, len(retry_profiles), "SSO")
+                    reauthed = 0
+                    for profile in retry_profiles:
+                        overlay.update_detail(
+                            f"SSO expired for '{self._profile_label(profile)}'. Re-authenticating..."
+                        )
+                        await self._reauth_sso_profile(profile)
+                        reauthed += 1
+                        overlay.update_progress(reauthed, len(retry_profiles), "SSO")
+                    overlay.update_detail(
+                        "Retrying bucket listing after SSO re-authentication..."
+                    )
+                    overlay.update_progress(0, profile_total, "Profiles")
+                    buckets, errors = await self.service.list_buckets_all(
+                        progress_callback=on_list_progress
+                    )
+            if token != self._load_token:
+                return
+            self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
+                buckets
+            )
+            cached_resolution: Optional[list[BucketInfo]] = None
+            if has_cached:
+                cached_resolution = self._reuse_cached_bucket_resolution(buckets, cached)
+
+            if cached_resolution is not None:
+                overlay.update_detail(
+                    "Using cached profile and permission mapping..."
+                )
+                overlay.update_progress(1, 1, "Permissions")
+                buckets = cached_resolution
+            else:
+                overlay.update_detail(
+                    "Testing permissions to choose best profile per bucket..."
+                )
+                overlay.update_progress(0, 1, "Permissions")
+
+                def on_probe_progress(
+                    completed: int,
+                    total: int,
+                    bucket_name: str,
+                    profile: Optional[str],
+                ) -> None:
+                    profile_label = self._profile_label(profile)
+                    overlay.update_detail(
+                        f"Checking {bucket_name} [{profile_label}] ({completed}/{max(1, total)})"
+                    )
+                    overlay.update_progress(completed, total, "Permissions")
+
+                buckets = await self.service.select_best_bucket_profiles(
+                    buckets,
+                    progress_callback=on_probe_progress,
+                )
+                if token != self._load_token:
+                    return
+                overlay.update_detail("Checking which buckets are empty...")
+                visible_count = len(
+                    [info for info in buckets if info.access != BUCKET_ACCESS_NO_VIEW]
+                )
+                overlay.update_progress(0, max(1, visible_count), "Empty")
+
+                def on_empty_progress(
+                    completed: int, total: int, bucket_name: str
+                ) -> None:
+                    overlay.update_detail(
+                        f"Checking empty status: {bucket_name} ({completed}/{max(1, total)})"
+                    )
+                    overlay.update_progress(completed, total, "Empty")
+
+                buckets = await self._resolve_bucket_empty_flags(
+                    buckets,
+                    progress_callback=on_empty_progress,
+                )
+                if token != self._load_token:
+                    return
+                if buckets:
+                    save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
+                    if callable(save_bucket_cache):
+                        await asyncio.to_thread(save_bucket_cache, buckets)
+
+            if not buckets and has_cached and errors:
+                self.path_input.placeholder = "bucket/prefix/ (cached)"
+                self.notify(
+                    "Using cached buckets because live refresh failed.",
+                    severity="warning",
+                )
+                if errors:
+                    failed = ", ".join(
+                        (profile or "default") for profile, _exc in errors[:3]
+                    )
+                    extra = ""
+                    if len(errors) > 3:
+                        extra = f" (+{len(errors) - 3} more)"
+                    self.notify(
+                        f"Some credentials could not list buckets: {failed}{extra}",
+                        severity="warning",
+                    )
+                return
+
+            self.path_input.placeholder = "bucket/prefix/"
+            overlay.update_detail("Rendering bucket list...")
+            overlay.update_progress(1, 1, "Finalize")
+            self._render_bucket_nodes(buckets)
+            if errors:
+                failed = ", ".join(
+                    (profile or "default") for profile, _exc in errors[:3]
+                )
+                extra = ""
+                if len(errors) > 3:
+                    extra = f" (+{len(errors) - 3} more)"
+                self.notify(
+                    f"Some credentials could not list buckets: {failed}{extra}",
+                    severity="warning",
+                )
+        finally:
+            try:
+                if overlay.is_mounted:
+                    overlay.dismiss(None)
+            except Exception:
+                pass
+
+    def _profile_candidates_for_bucket(self, bucket: str) -> list[Optional[str]]:
+        candidates = list(self.bucket_profile_candidates.get(bucket, []))
+        if not candidates:
+            profile = self._profile_for_bucket(bucket)
+            if profile not in candidates:
+                candidates.append(profile)
+        profile_order = {}
+        if hasattr(self.service, "profiles"):
+            service_profiles = list(getattr(self.service, "profiles"))
+            profile_order = {
+                profile: index for index, profile in enumerate(service_profiles)
+            }
+            for profile in service_profiles:
+                if profile not in candidates:
+                    candidates.append(profile)
+        candidates = sorted(
+            candidates,
+            key=lambda profile: (
+                profile is None,
+                profile_order.get(profile, len(profile_order)),
+            ),
+        )
+        return candidates
+
+    def _switch_bucket_profile(
+        self,
+        bucket: str,
+        old_profile: Optional[str],
+        new_profile: Optional[str],
+        current_node: object,
+        new_access: Optional[str] = None,
+    ) -> None:
+        existing_access = self._bucket_access_for_name(bucket)
+        chosen_access = new_access or existing_access
+        existing_is_empty = self._bucket_is_empty_for_name(bucket)
+        if old_profile == new_profile:
+            bucket_node = self.bucket_nodes.get((new_profile, bucket))
+            if bucket_node is not None:
+                try:
+                    bucket_node.data = NodeInfo(
+                        profile=new_profile, bucket=bucket, prefix=""
+                    )
+                except Exception:
+                    pass
+                try:
+                    label = self._bucket_label(
+                        BucketInfo(
+                            name=bucket,
+                            profile=new_profile,
+                            access=chosen_access,
+                            is_empty=existing_is_empty,
+                        )
+                    )
+                    bucket_node.set_label(label)
+                except Exception:
+                    pass
+            updated: list[BucketInfo] = []
+            for info in self.buckets:
+                if info.name == bucket:
+                    updated.append(
+                        BucketInfo(
+                            name=info.name,
+                            profile=info.profile,
+                            access=chosen_access,
+                            is_empty=info.is_empty,
+                        )
+                    )
+                else:
+                    updated.append(info)
+            self.buckets = updated
+            return
+        old_bucket_key = (old_profile, bucket)
+        source_profile = old_profile
+        bucket_node = self.bucket_nodes.get(old_bucket_key)
+        if bucket_node is None:
+            for (profile_key, name), candidate in self.bucket_nodes.items():
+                if name != bucket:
+                    continue
+                source_profile = profile_key
+                bucket_node = candidate
+                break
+        if bucket_node is not None:
+            if source_profile is not None or old_bucket_key in self.bucket_nodes:
+                self.bucket_nodes.pop((source_profile, bucket), None)
+            self.bucket_nodes.pop(old_bucket_key, None)
+            self.bucket_nodes[(new_profile, bucket)] = bucket_node
+            try:
+                bucket_node.data = NodeInfo(profile=new_profile, bucket=bucket, prefix="")
+            except Exception:
+                pass
+            try:
+                label = self._bucket_label(
+                    BucketInfo(
+                        name=bucket,
+                        profile=new_profile,
+                        access=chosen_access,
+                        is_empty=existing_is_empty,
+                    )
+                )
+                bucket_node.set_label(label)
+            except Exception:
+                pass
+        else:
+            replacement = self.bucket_nodes.pop(old_bucket_key, None)
+            if replacement is not None:
+                self.bucket_nodes[(new_profile, bucket)] = replacement
+
+        current_data = getattr(current_node, "data", None)
+        if isinstance(current_data, NodeInfo):
+            if current_data.bucket == bucket and current_data.profile == old_profile:
+                try:
+                    current_node.data = NodeInfo(
+                        profile=new_profile,
+                        bucket=current_data.bucket,
+                        prefix=current_data.prefix,
+                    )
+                except Exception:
+                    pass
+
+        updated: list[BucketInfo] = []
+        for info in self.buckets:
+            if info.name == bucket:
+                updated.append(
+                    BucketInfo(
+                        name=info.name,
+                        profile=new_profile,
+                        access=chosen_access,
+                        is_empty=info.is_empty,
+                    )
+                )
+            else:
+                updated.append(info)
+        self.buckets = updated
+
+        profile_to_replace = source_profile if bucket_node is not None else old_profile
+        prefix_updates: list[
+            tuple[
+                tuple[Optional[str], str, str],
+                tuple[Optional[str], str, str],
+                object,
+            ]
+        ] = []
+        for key, prefix_node in self.prefix_nodes.items():
+            profile, key_bucket, prefix = key
+            if key_bucket != bucket or profile != profile_to_replace:
+                continue
+            new_key = (new_profile, bucket, prefix)
+            prefix_updates.append((key, new_key, prefix_node))
+        for old_key, new_key, prefix_node in prefix_updates:
+            self.prefix_nodes.pop(old_key, None)
+            self.prefix_nodes[new_key] = prefix_node
+            data = getattr(prefix_node, "data", None)
+            if isinstance(data, NodeInfo):
+                try:
+                    prefix_node.data = NodeInfo(
+                        profile=new_profile,
+                        bucket=data.bucket,
+                        prefix=data.prefix,
+                    )
+                except Exception:
+                    pass
+
+        candidates = self.bucket_profile_candidates.setdefault(bucket, [])
+        if new_profile not in candidates:
+            candidates.append(new_profile)
+
+    async def _try_bucket_profile_fallback(
+        self, info: NodeInfo, node: object
+    ) -> tuple[Optional[tuple[NodeInfo, list[str], list[ObjectInfo], bool]], list[Optional[str]]]:
+        candidates = self._profile_candidates_for_bucket(info.bucket)
+        attempted: list[Optional[str]] = []
+        for profile in candidates:
+            if profile == info.profile:
+                continue
+            attempted.append(profile)
+            try:
+                prefixes, objects, has_any = await self._call_with_sso_retry(
+                    profile,
+                    self.service.list_prefixes_and_objects,
+                    profile,
+                    info.bucket,
+                    info.prefix,
+                )
+            except Exception:
+                continue
+            new_info = NodeInfo(profile=profile, bucket=info.bucket, prefix=info.prefix)
+            access = BUCKET_ACCESS_GOOD
+            bucket_access = getattr(self.service, "bucket_access", None)
+            if callable(bucket_access):
+                try:
+                    access = await self._call_with_sso_retry(
+                        profile,
+                        bucket_access,
+                        profile,
+                        info.bucket,
+                    )
+                except Exception:
+                    access = BUCKET_ACCESS_GOOD
+            self._switch_bucket_profile(
+                info.bucket,
+                info.profile,
+                profile,
+                node,
+                new_access=access,
+            )
+            self.current_context = new_info
+            self._set_profile_indicator(new_info.profile, new_info.bucket)
+            self.notify(
+                f"Using profile '{profile or 'default'}' for bucket '{info.bucket}'.",
+                severity="warning",
+            )
+            save_bucket_cache = getattr(self.service, "save_bucket_cache", None)
+            if callable(save_bucket_cache):
+                await asyncio.to_thread(save_bucket_cache, self.buckets)
+            return (new_info, prefixes, objects, has_any), attempted
+        return None, attempted
 
     async def show_prefix(self, node, info: NodeInfo) -> None:
+        selected_profile = self._profile_for_bucket(info.bucket)
+        if selected_profile != info.profile:
+            info = NodeInfo(
+                profile=selected_profile,
+                bucket=info.bucket,
+                prefix=info.prefix,
+            )
+            try:
+                node.data = info
+            except Exception:
+                pass
+        resolved_profile, resolved_access = await self._resolve_profile_for_bucket_access(
+            info.bucket,
+            info.profile,
+        )
+        if (
+            resolved_profile != info.profile
+            or self._bucket_access_for_name(info.bucket) != resolved_access
+        ):
+            self._switch_bucket_profile(
+                info.bucket,
+                info.profile,
+                resolved_profile,
+                node,
+                new_access=resolved_access,
+            )
+            info = NodeInfo(
+                profile=resolved_profile,
+                bucket=info.bucket,
+                prefix=info.prefix,
+            )
+            try:
+                node.data = info
+            except Exception:
+                pass
         self.current_context = info
+        self._set_profile_indicator(info.profile, info.bucket)
         self._preview_token += 1
         self._clear_selection()
         self._filter_input_value = ""
@@ -927,28 +2629,76 @@ class S3Browser(App):
         canonical = path if path.endswith("/") else f"{path}/"
         self._set_path_value(path, canonical=canonical, suppress_filter=True)
         self._clear_table()
-        self.s3_table.add_row("", "Loading...", "", "")
+        self.s3_table.add_row("", "Loading...", "", "", "")
         try:
-            prefixes, objects, has_any = await self.service.list_prefixes_and_objects(
-                info.profile, info.bucket, info.prefix
+            prefixes, objects, has_any = await self._call_with_sso_retry(
+                info.profile,
+                self.service.list_prefixes_and_objects,
+                info.profile,
+                info.bucket,
+                info.prefix,
             )
         except Exception as exc:
-            if self._pending_target_node is node and self._pending_created:
-                prev_node = self._pending_prev_node
-                self._remove_pending_nodes()
-                self._clear_pending()
-                if prev_node is not None:
-                    self.s3_tree.select_node(prev_node)
-                else:
-                    self.s3_tree.select_node(self.s3_tree.root)
-                self.notify(f"{exc}", severity="error")
+            fallback, attempted = await self._try_bucket_profile_fallback(info, node)
+            if fallback is not None:
+                info, prefixes, objects, has_any = fallback
+            else:
+                if self._pending_target_node is node and self._pending_created:
+                    prev_node = self._pending_prev_node
+                    self._remove_pending_nodes()
+                    self._clear_pending()
+                    if prev_node is not None:
+                        self.s3_tree.select_node(prev_node)
+                    else:
+                        self.s3_tree.select_node(self.s3_tree.root)
+                    self.notify(f"{exc}", severity="error")
+                    return
+                tried = [info.profile, *attempted]
+                tried_text = ", ".join(profile or "default" for profile in tried)
+                self._clear_table()
+                self._content_rows = [
+                    (
+                        f"Access denied or unavailable ({tried_text})",
+                        "",
+                        "",
+                        "",
+                        RowInfo(kind="error"),
+                    )
+                ]
+                self._active_filter = ""
+                self._add_row(
+                    f"Access denied or unavailable ({tried_text})",
+                    "",
+                    "",
+                    "",
+                    RowInfo(kind="error"),
+                )
+                self.notify(f"Tried profiles: {tried_text}. {exc}", severity="error")
                 return
-            self._clear_table()
-            self._content_rows = [("Access denied or unavailable", "", "", RowInfo(kind="error"))]
-            self._active_filter = ""
-            self._add_row("Access denied or unavailable", "", "", RowInfo(kind="error"))
-            self.notify(f"{exc}", severity="error")
-            return
+
+        if self._bucket_access_for_name(info.bucket) == BUCKET_ACCESS_NO_VIEW:
+            access = BUCKET_ACCESS_NO_DOWNLOAD
+            bucket_access = getattr(self.service, "bucket_access", None)
+            if callable(bucket_access):
+                try:
+                    access = await self._call_with_sso_retry(
+                        info.profile,
+                        bucket_access,
+                        info.profile,
+                        info.bucket,
+                    )
+                except Exception:
+                    access = BUCKET_ACCESS_NO_DOWNLOAD
+            if access == BUCKET_ACCESS_NO_VIEW:
+                access = BUCKET_ACCESS_NO_DOWNLOAD
+            self._switch_bucket_profile(
+                info.bucket,
+                info.profile,
+                info.profile,
+                node,
+                new_access=access,
+            )
+
         if not has_any and info.prefix:
             if self._pending_target_node is node and self._pending_created:
                 prev_node = self._pending_prev_node
@@ -970,32 +2720,41 @@ class S3Browser(App):
         self._sync_prefix_children(node, info, prefixes)
         prefixes_sorted = sorted(prefixes)
         objects_sorted = sorted(objects, key=lambda o: o.key.lower())
-        rows: list[tuple[str, str, str, RowInfo]] = []
+        rows: list[tuple[str, str, str, str, RowInfo]] = []
         for prefix in prefixes_sorted:
             name = display_segment(prefix, info.prefix)
+            row_info = RowInfo(
+                kind="prefix",
+                profile=info.profile,
+                bucket=info.bucket,
+                prefix=prefix,
+            )
             rows.append(
                 (
                     name,
+                    kind_for_row(row_info),
                     "",
                     "",
-                    RowInfo(kind="prefix", profile=info.profile, bucket=info.bucket, prefix=prefix),
+                    row_info,
                 )
             )
         for obj in objects_sorted:
             name = display_segment(obj.key, info.prefix)
+            row_info = RowInfo(
+                kind="object",
+                profile=info.profile,
+                bucket=info.bucket,
+                key=obj.key,
+                size=obj.size,
+                last_modified=obj.last_modified,
+            )
             rows.append(
                 (
                     name,
+                    kind_for_row(row_info),
                     format_size(obj.size),
                     format_time(obj.last_modified),
-                    RowInfo(
-                        kind="object",
-                        profile=info.profile,
-                        bucket=info.bucket,
-                        key=obj.key,
-                        size=obj.size,
-                        last_modified=obj.last_modified,
-                    ),
+                    row_info,
                 )
             )
         self._content_rows = rows
@@ -1014,16 +2773,21 @@ class S3Browser(App):
             self._record_history(info)
 
     def show_bucket_list(self) -> None:
+        self._set_profile_indicator(None)
         self._clear_table()
         self._clear_selection()
         self._filter_input_value = ""
         self._preview_token += 1
         suppress_history = self._consume_history_suppression()
-        rows: list[tuple[str, str, str, RowInfo]] = []
-        for bucket in self.buckets:
+        rows: list[tuple[str, str, str, str, RowInfo]] = []
+        for bucket in self._visible_buckets():
+            display_name = bucket.name
+            if self._is_bucket_favorite(bucket.name):
+                display_name = f"{display_name} ★"
             rows.append(
                 (
-                    bucket.name,
+                    display_name,
+                    "dir",
                     "",
                     "",
                     RowInfo(kind="bucket", profile=bucket.profile, bucket=bucket.name),
@@ -1101,8 +2865,12 @@ class S3Browser(App):
         self._set_preview_text("Loading stats...")
         prefix = info.prefix or ""
         try:
-            prefixes, objects, _ = await self.service.list_prefixes_and_objects(
-                info.profile, info.bucket, prefix
+            prefixes, objects, _ = await self._call_with_sso_retry(
+                info.profile,
+                self.service.list_prefixes_and_objects,
+                info.profile,
+                info.bucket,
+                prefix,
             )
         except Exception as exc:
             if token != self._preview_token:
@@ -1128,7 +2896,9 @@ class S3Browser(App):
         self._set_preview_button("Scan", visible=True, disabled=True)
         prefix = info.prefix or ""
         try:
-            deep_values = await self.service.scan_prefix_recursive(
+            deep_values = await self._call_with_sso_retry(
+                info.profile,
+                self.service.scan_prefix_recursive,
                 info.profile,
                 info.bucket,
                 prefix,
@@ -1161,8 +2931,13 @@ class S3Browser(App):
         self._clear_stats_state()
         self._set_preview_button("More", visible=False)
         try:
-            data, total, truncated = await self.service.get_object_head(
-                info.profile, info.bucket, info.key, max_bytes=self._preview_bytes
+            data, total, truncated = await self._call_with_sso_retry(
+                info.profile,
+                self.service.get_object_head,
+                info.profile,
+                info.bucket,
+                info.key,
+                max_bytes=self._preview_bytes,
             )
         except Exception as exc:
             if token != self._preview_token:
@@ -1186,7 +2961,9 @@ class S3Browser(App):
         self._preview_token += 1
         token = self._preview_token
         try:
-            data, total, truncated = await self.service.get_object_range(
+            data, total, truncated = await self._call_with_sso_retry(
+                info.profile,
+                self.service.get_object_range,
                 info.profile,
                 info.bucket,
                 info.key,
@@ -1210,7 +2987,9 @@ class S3Browser(App):
 
     def navigate_to(self, profile: Optional[str], bucket: str, prefix: str) -> None:
         prev_node = self.s3_tree.cursor_node
-        node, created = self.ensure_tree_path(profile, bucket, prefix, track_created=True)
+        node, created = self.ensure_tree_path(
+            profile, bucket, prefix, track_created=True
+        )
         self._pending_created = created
         self._pending_prev_node = prev_node
         self._pending_target_node = node
@@ -1222,13 +3001,20 @@ class S3Browser(App):
         self.s3_tree.scroll_to_node(node)
 
     def ensure_tree_path(
-        self, profile: Optional[str], bucket: str, prefix: str, track_created: bool = False
+        self,
+        profile: Optional[str],
+        bucket: str,
+        prefix: str,
+        track_created: bool = False,
     ):
         created: list[tuple[object, str, tuple]] = []
         bucket_node = self.bucket_nodes.get((profile, bucket))
         if not bucket_node:
+            access = self._bucket_access_for_name(bucket)
             bucket_node = self.s3_tree.root.add(
-                Text(bucket, style="bold cyan"),
+                self._bucket_label(
+                    BucketInfo(name=bucket, profile=profile, access=access)
+                ),
                 data=NodeInfo(profile=profile, bucket=bucket, prefix=""),
                 allow_expand=True,
             )
@@ -1289,10 +3075,16 @@ class S3Browser(App):
         self._row_keys = []
         self._row_info = {}
 
-    def _add_row(self, name: str, size: str, modified: str, info: RowInfo) -> None:
+    def _add_row(
+        self, name: str, kind: str, size: str, modified: str, info: RowInfo
+    ) -> None:
+        name_style = ""
+        if info.kind == "bucket":
+            name_style = self._bucket_name_style(self._bucket_access_for_name(info.bucket))
         row_key = self.s3_table.add_row(
-            row_icon(info),
-            name,
+            ellipsis_text(row_icon(info)),
+            ellipsis_text(name, style=name_style),
+            ellipsis_text(kind),
             size_cell(size, info.size),
             modified_cell(modified, info.last_modified),
         )
@@ -1421,6 +3213,21 @@ class S3Browser(App):
             return path.parent
         return path
 
+    def _prefix_download_name(self, info: RowInfo) -> str:
+        if info.prefix:
+            parts = [part for part in info.prefix.strip("/").split("/") if part]
+            if parts:
+                return parts[-1]
+        if info.bucket:
+            return info.bucket
+        return "download"
+
+    def _resolve_prefix_download_dir(self, target: str, info: RowInfo) -> Path:
+        path = Path(target).expanduser()
+        if target.endswith(("/", "\\")) or (path.exists() and path.is_dir()):
+            return path / self._prefix_download_name(info)
+        return path
+
     def _object_key(self, info: RowInfo) -> Optional[tuple[Optional[str], str, str]]:
         if info.kind != "object" or not info.bucket or not info.key:
             return None
@@ -1444,7 +3251,7 @@ class S3Browser(App):
                 continue
             key = self._object_key(info)
             if key and key in self._selected_objects:
-                    selected.append(info)
+                selected.append(info)
         return selected
 
     def _download_info_lines(self, selected: list[RowInfo]) -> list[str]:
@@ -1471,6 +3278,12 @@ class S3Browser(App):
         if len(paths) > preview_count:
             lines.append(f"  ... and {len(paths) - preview_count} more")
         return lines
+
+    def _download_prefix_info_lines(self, info: RowInfo) -> list[str]:
+        path = self._path_for_row(info)
+        if not path:
+            return ["Selected folder"]
+        return ["Selected folder:", f"  {path}", "Includes all files under this folder"]
 
     def _update_selection_summary(self) -> None:
         selected = self._selected_object_infos()
@@ -1502,7 +3315,9 @@ class S3Browser(App):
             self._set_preview_button("More", visible=False)
             self._showing_selection_summary = False
 
-    def handle_table_selection_click(self, row_index: int, shift: bool, toggle: bool) -> None:
+    def handle_table_selection_click(
+        self, row_index: int, shift: bool, toggle: bool
+    ) -> None:
         if row_index < 0 or row_index >= len(self._row_keys):
             return
         row_key = self._row_keys[row_index]
@@ -1553,7 +3368,9 @@ class S3Browser(App):
             return
         bucket, prefix = self._parse_s3_path(target)
         if not bucket:
-            self.notify("Path must include a bucket (s3://bucket/prefix/)", severity="warning")
+            self.notify(
+                "Path must include a bucket (s3://bucket/prefix/)", severity="warning"
+            )
             return
         profile = self._profile_for_bucket(bucket)
         self.navigate_to(profile, bucket, prefix)
@@ -1576,16 +3393,14 @@ class S3Browser(App):
         )
 
     def on_key(self, event: events.Key) -> None:
+        if event.key != "escape" and self._quit_escape_deadline:
+            self._quit_escape_deadline = 0.0
         if self.path_input.has_focus:
             return
-        if not event.is_printable or not event.character:
-            return
-        if event.key == "space" or event.character == " ":
-            return
-        if event.key in {"q", "r", "m"}:
+        if event.key != "slash" and event.character != "/":
             return
         self.set_focus(self.path_input)
-        self.path_input.insert_text_at_cursor(event.character)
+        self.path_input.insert_text_at_cursor("/")
         event.stop()
 
     def _parse_s3_path(self, value: str) -> tuple[str, str]:
@@ -1663,18 +3478,18 @@ class S3Browser(App):
             remainder = remainder.split("/")[-1]
         return remainder
 
-    def _sorted_content_rows(self) -> list[tuple[str, str, str, RowInfo]]:
+    def _sorted_content_rows(self) -> list[tuple[str, str, str, str, RowInfo]]:
         rows = list(self._content_rows)
         if not self._sort_column:
             return rows
 
-        def is_object(row: tuple[str, str, str, RowInfo]) -> bool:
-            return row[3].kind == "object"
+        def is_object(row: tuple[str, str, str, str, RowInfo]) -> bool:
+            return row[4].kind == "object"
 
         dirs = [row for row in rows if not is_object(row)]
         files = [row for row in rows if is_object(row)]
 
-        def name_key(row: tuple[str, str, str, RowInfo]) -> str:
+        def name_key(row: tuple[str, str, str, str, RowInfo]) -> str:
             return row[0].casefold()
 
         if self._sort_column == "name":
@@ -1682,11 +3497,20 @@ class S3Browser(App):
             files_sorted = sorted(files, key=name_key, reverse=self._sort_reverse)
             return dirs_sorted + files_sorted
 
+        if self._sort_column == "kind":
+            dirs_sorted = sorted(dirs, key=name_key, reverse=self._sort_reverse)
+
+            def kind_key(row: tuple[str, str, str, str, RowInfo]) -> tuple[str, str]:
+                return (row[1].casefold(), name_key(row))
+
+            files_sorted = sorted(files, key=kind_key, reverse=self._sort_reverse)
+            return dirs_sorted + files_sorted
+
         if self._sort_column == "size":
             dirs_sorted = sorted(dirs, key=name_key, reverse=self._sort_reverse)
 
-            def size_key(row: tuple[str, str, str, RowInfo]) -> tuple[int, str]:
-                info = row[3]
+            def size_key(row: tuple[str, str, str, str, RowInfo]) -> tuple[int, str]:
+                info = row[4]
                 return (info.size or 0, name_key(row))
 
             files_sorted = sorted(files, key=size_key, reverse=self._sort_reverse)
@@ -1695,8 +3519,10 @@ class S3Browser(App):
         if self._sort_column == "modified":
             dirs_sorted = sorted(dirs, key=name_key, reverse=self._sort_reverse)
 
-            def modified_key(row: tuple[str, str, str, RowInfo]) -> tuple[datetime, str]:
-                info = row[3]
+            def modified_key(
+                row: tuple[str, str, str, str, RowInfo],
+            ) -> tuple[datetime, str]:
+                info = row[4]
                 return (info.last_modified or datetime.min, name_key(row))
 
             files_sorted = sorted(files, key=modified_key, reverse=self._sort_reverse)
@@ -1709,21 +3535,21 @@ class S3Browser(App):
             return
         self._active_filter = text
         self._clear_table()
-        for name, size, modified, info in self._sorted_content_rows():
+        for name, kind, size, modified, info in self._sorted_content_rows():
             if info.kind == "parent":
-                self._add_row(name, size, modified, info)
+                self._add_row(name, kind, size, modified, info)
                 continue
             if not text or name.startswith(text):
-                self._add_row(name, size, modified, info)
+                self._add_row(name, kind, size, modified, info)
         self.s3_table.call_after_refresh(self._resize_table_columns)
 
     def _profile_for_bucket(self, bucket: str) -> Optional[str]:
-        for (profile, name), _node in self.bucket_nodes.items():
-            if name == bucket:
-                return profile
         for info in self.buckets:
             if info.name == bucket:
                 return info.profile
+        for (profile, name), _node in self.bucket_nodes.items():
+            if name == bucket:
+                return profile
         return None
 
     def _set_preview_text(self, text: str) -> None:
@@ -1735,7 +3561,9 @@ class S3Browser(App):
     def _set_preview_header(self, text: str) -> None:
         self.preview_header.update(text)
 
-    def _set_preview_button(self, label: str, visible: bool, disabled: bool = False) -> None:
+    def _set_preview_button(
+        self, label: str, visible: bool, disabled: bool = False
+    ) -> None:
         self.preview_more.label = label
         self.preview_more.disabled = disabled
         if visible:
@@ -1795,9 +3623,7 @@ class S3Browser(App):
                     f"(scanned {deep.scanned} objects)"
                 )
                 subdirs_line = f"Total subdirs (recursive): >= {deep.subdirs} (partial)"
-                size_line = (
-                    f"Total size (recursive): >= {format_size(deep.total_size)} (partial)"
-                )
+                size_line = f"Total size (recursive): >= {format_size(deep.total_size)} (partial)"
             lines.extend([files_line, subdirs_line, size_line])
             lines.append("Scope: immediate children + recursive totals")
             self._set_preview_button("Scan", visible=False)
@@ -1814,17 +3640,24 @@ class S3Browser(App):
         self._preview_stats_deep = deep
 
     def _update_sort_headers(self) -> None:
-        if not self._col_name or not self._col_size or not self._col_modified:
+        if (
+            not self._col_name
+            or not self._col_kind
+            or not self._col_size
+            or not self._col_modified
+        ):
             return
         if not hasattr(self, "s3_table"):
             return
         column_map = {
             "name": self._col_name,
+            "kind": self._col_kind,
             "size": self._col_size,
             "modified": self._col_modified,
         }
         base_labels = {
             self._col_name: "Name",
+            self._col_kind: "Kind",
             self._col_size: "Size",
             self._col_modified: "Modified",
         }
