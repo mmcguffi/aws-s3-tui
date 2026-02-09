@@ -83,9 +83,10 @@ class TestTuiMount(unittest.IsolatedAsyncioTestCase):
         app.service = _StubService()
         async with app.run_test() as pilot:
             app.set_focus(app.s3_tree)
+            before = app.path_input.value
             await pilot.press("/")
             self.assertIs(app.focused, app.path_input)
-            self.assertEqual(app.path_input.value, "/")
+            self.assertEqual(app.path_input.value, before)
 
     async def test_non_slash_key_does_not_focus_path_input(self) -> None:
         app = S3Browser(profiles=["default"])
@@ -94,6 +95,27 @@ class TestTuiMount(unittest.IsolatedAsyncioTestCase):
             app.set_focus(app.s3_tree)
             await pilot.press("a")
             self.assertIs(app.focused, app.s3_tree)
+
+    async def test_down_from_path_focuses_file_explorer(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.service = _StubService()
+        async with app.run_test() as pilot:
+            app.set_focus(app.path_input)
+            await pilot.press("down")
+            self.assertIs(app.focused, app.s3_table)
+
+    async def test_preview_focus_toggles_preview_highlight(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.service = _StubService()
+        async with app.run_test() as pilot:
+            preview_container = app.query_one("#preview")
+            self.assertFalse(preview_container.has_class("preview-focused"))
+            app.set_focus(app.preview)
+            await pilot.pause()
+            self.assertTrue(preview_container.has_class("preview-focused"))
+            app.set_focus(app.s3_tree)
+            await pilot.pause()
+            self.assertFalse(preview_container.has_class("preview-focused"))
 
     async def test_startup_uses_cached_buckets_without_live_listing(self) -> None:
         app = S3Browser(profiles=["default"])
