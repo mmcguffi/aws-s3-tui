@@ -18,6 +18,12 @@ From PyPI:
 pip3 install awss3tui
 ```
 
+From source (dev/local):
+
+```bash
+pip3 install -e .
+```
+
 This installs the `s3` console script for the TUI and CLI helpers.
 
 ## Quick Start
@@ -173,6 +179,12 @@ You can manually switch profile per bucket from the profile button in the path b
 ### Preview and stats
 
 - File preview loads first `4096` bytes, with `m`/More to fetch additional chunks.
+- `.gz` files are previewed as decompressed text automatically.
+- `.sam`, `.bam`, and `.cram` previews use `samtools view -h` behind the scenes and show a head snippet.
+- If `samtools` is not available, those files fall back to the normal byte-based preview.
+- Syntax highlighting is enabled automatically for Textual-supported languages (for example: JSON, YAML, TOML, XML, Markdown, Python, SQL).
+- `.csv` and `.tsv` highlighting is enabled when `tree-sitter-language-pack` is installed (included as a project dependency in current versions).
+- `m`/More is only available for normal byte-based previews and folder recursive scans.
 - Folder preview shows immediate child stats.
 - Press `m` on a folder preview to run recursive scan (up to `50,000` keys; reports partials when truncated).
 

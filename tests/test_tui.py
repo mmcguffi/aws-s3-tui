@@ -104,6 +104,14 @@ class TestTuiMount(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             self.assertIs(app.focused, app.s3_table)
 
+    async def test_name_header_shows_default_sort_arrow(self) -> None:
+        app = S3Browser(profiles=["default"])
+        app.service = _StubService()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(app._sort_column, "name")
+            self.assertIn("▲", app.s3_table.columns[app._col_name].label.plain)
+
     async def test_preview_focus_toggles_preview_highlight(self) -> None:
         app = S3Browser(profiles=["default"])
         app.service = _StubService()

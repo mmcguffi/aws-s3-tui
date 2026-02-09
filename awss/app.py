@@ -4,21 +4,24 @@ import argparse
 import asyncio
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from time import monotonic
-from typing import Optional
+from typing import Literal, Optional
 
 from rich.console import Console
-from rich.style import Style
 from rich.measure import Measurement
 from rich.segment import Segment
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import events
+from textual._tree_sitter import get_language as textual_get_language
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -36,14 +39,16 @@ from textual.widgets import (
     Tree,
 )
 
-from .s3 import BucketInfo, ObjectInfo, S3Service
+from .gen_sso_profiles import main as generate_config_main
 from .s3 import (
     BUCKET_ACCESS_GOOD,
     BUCKET_ACCESS_NO_DOWNLOAD,
     BUCKET_ACCESS_NO_VIEW,
     BUCKET_ACCESS_UNKNOWN,
+    BucketInfo,
+    ObjectInfo,
+    S3Service,
 )
-from .gen_sso_profiles import main as generate_config_main
 
 
 @dataclass(frozen=True)
@@ -717,6 +722,95 @@ def kind_from_name(name: str) -> str:
     return mapping.get(ext, ext)
 
 
+PREVIEW_MODE_PLAIN = "plain"
+PREVIEW_MODE_GZIP = "gzip"
+PREVIEW_MODE_SAMTOOLS = "samtools"
+SAMTOOLS_PREVIEW_MAX_INPUT_BYTES = 256 * 1024
+GZIP_PREVIEW_MAX_INPUT_BYTES = 64 * 1024
+SAMTOOLS_HEAD_LINES = 40
+PREVIEW_LANGUAGE_BY_KIND = {
+    "json": "json",
+    "ndjson": "json",
+    "yaml": "yaml",
+    "yml": "yaml",
+    "toml": "toml",
+    "xml": "xml",
+    "html": "html",
+    "md": "markdown",
+    "markdown": "markdown",
+    "csv": "csv",
+    "tsv": "tsv",
+    "py": "python",
+    "js": "javascript",
+    "mjs": "javascript",
+    "cjs": "javascript",
+    "sql": "sql",
+    "css": "css",
+    "sh": "bash",
+    "bash": "bash",
+    "zsh": "bash",
+    "go": "go",
+    "java": "java",
+    "rs": "rust",
+}
+CSV_TSV_HIGHLIGHT_QUERY = r"""
+((_) @operator (#match? @operator "^[,\t]$"))
+((_) @number (#match? @number "^-?[0-9]+([.][0-9]+)?$"))
+((_) @string (#match? @string "^\".*\"$"))
+"""
+
+
+def _is_gzip_name(name: str) -> bool:
+    suffixes = PurePosixPath(name).suffixes
+    return bool(suffixes and suffixes[-1].lower() == ".gz")
+
+
+def _preview_mode_for_name(name: str) -> Literal["plain", "gzip", "samtools"]:
+    kind = kind_from_name(name)
+    if kind in {"sam", "bam", "cram"}:
+        return PREVIEW_MODE_SAMTOOLS
+    if _is_gzip_name(name):
+        return PREVIEW_MODE_GZIP
+    return PREVIEW_MODE_PLAIN
+
+
+def _decode_gzip_preview(data: bytes, max_output_bytes: int) -> Optional[str]:
+    if not data:
+        return ""
+    try:
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        decoded = decompressor.decompress(data, max_output_bytes)
+    except zlib.error:
+        return None
+    return decoded.decode("utf-8", errors="replace")
+
+
+def _head_lines(text: str, max_lines: int) -> str:
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text.rstrip("\n")
+    return "\n".join(lines[:max_lines])
+
+
+def _preview_language_for_name(name: str) -> Optional[str]:
+    kind = kind_from_name(name)
+    return PREVIEW_LANGUAGE_BY_KIND.get(kind)
+
+
+def _resolve_tree_sitter_language(language_name: str):
+    language = textual_get_language(language_name)
+    if language is not None:
+        return language
+    try:
+        from tree_sitter_language_pack import get_language as pack_get_language
+    except ImportError:
+        return None
+    try:
+        return pack_get_language(language_name)
+    except Exception:
+        return None
+
+
 class S3Browser(App):
     CSS = """
     #path-bar {
@@ -1040,10 +1134,12 @@ class S3Browser(App):
         self._preview_next_start = 0
         self._preview_total: Optional[int] = None
         self._preview_truncated = False
+        self._preview_mode: Literal["plain", "gzip", "samtools"] = PREVIEW_MODE_PLAIN
+        self._preview_language: Optional[str] = None
         self._preview_stats_info: Optional[RowInfo] = None
         self._preview_stats_shallow: Optional[PrefixStats] = None
         self._preview_stats_deep: Optional[DeepStats] = None
-        self._sort_column: Optional[str] = None
+        self._sort_column: Optional[str] = "name"
         self._sort_reverse = False
         self._suppress_filter = False
         self._history: list[Optional[NodeInfo]] = []
@@ -1065,6 +1161,7 @@ class S3Browser(App):
         self._hide_empty_buckets = False
         self._show_only_favorite_buckets = False
         self._favorite_buckets: set[str] = set()
+        self._samtools_available: Optional[bool] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1146,6 +1243,7 @@ class S3Browser(App):
         self.preview_container = self.query_one("#preview", Vertical)
         self.preview_header = self.query_one("#preview-header", Static)
         self.preview = self.query_one("#preview-content", TextArea)
+        self._register_optional_preview_languages()
         self.preview_status = self.query_one("#preview-status", Static)
         self.preview_more = self.query_one("#preview-more", Button)
         self.bucket_filter_no_view = self.query_one("#bucket-filter-no-view", Button)
@@ -1153,7 +1251,9 @@ class S3Browser(App):
             "#bucket-filter-no-download", Button
         )
         self.bucket_filter_empty = self.query_one("#bucket-filter-empty", Button)
-        self.bucket_filter_favorites = self.query_one("#bucket-filter-favorites", Button)
+        self.bucket_filter_favorites = self.query_one(
+            "#bucket-filter-favorites", Button
+        )
         self._set_path_value("s3://", canonical="s3://", suppress_filter=True)
         self._set_profile_indicator(None)
         await self._load_favorite_buckets()
@@ -1455,7 +1555,9 @@ class S3Browser(App):
         except Exception:
             return
         if isinstance(favorites, set):
-            self._favorite_buckets = {name for name in favorites if isinstance(name, str)}
+            self._favorite_buckets = {
+                name for name in favorites if isinstance(name, str)
+            }
             return
         if isinstance(favorites, list):
             self._favorite_buckets = {
@@ -1474,7 +1576,9 @@ class S3Browser(App):
             return
 
     async def _load_bucket_filter_state(self) -> None:
-        load_bucket_filter_state = getattr(self.service, "load_bucket_filter_state", None)
+        load_bucket_filter_state = getattr(
+            self.service, "load_bucket_filter_state", None
+        )
         if not callable(load_bucket_filter_state):
             return
         try:
@@ -1489,7 +1593,9 @@ class S3Browser(App):
         self._show_only_favorite_buckets = bool(state.get("only_favorites", False))
 
     async def _save_bucket_filter_state(self) -> None:
-        save_bucket_filter_state = getattr(self.service, "save_bucket_filter_state", None)
+        save_bucket_filter_state = getattr(
+            self.service, "save_bucket_filter_state", None
+        )
         if not callable(save_bucket_filter_state):
             return
         state = self._bucket_filter_state_payload()
@@ -1546,12 +1652,18 @@ class S3Browser(App):
             return True
         if self._hide_empty_buckets and bucket.is_empty:
             return True
-        if self._show_only_favorite_buckets and not self._is_bucket_favorite(bucket.name):
+        if self._show_only_favorite_buckets and not self._is_bucket_favorite(
+            bucket.name
+        ):
             return True
         return False
 
     def _visible_buckets(self) -> list[BucketInfo]:
-        return [bucket for bucket in self.buckets if not self._bucket_hidden_by_filter(bucket)]
+        return [
+            bucket
+            for bucket in self.buckets
+            if not self._bucket_hidden_by_filter(bucket)
+        ]
 
     async def _toggle_bucket_filter(self, filter_name: str) -> None:
         if filter_name == "hide_no_view":
@@ -1635,7 +1747,8 @@ class S3Browser(App):
         profile_order: dict[Optional[str], int] = {}
         if hasattr(self.service, "profiles"):
             profile_order = {
-                profile: index for index, profile in enumerate(getattr(self.service, "profiles"))
+                profile: index
+                for index, profile in enumerate(getattr(self.service, "profiles"))
             }
 
         async def probe_access(profile: Optional[str]) -> str:
@@ -1791,9 +1904,7 @@ class S3Browser(App):
         if not info.bucket or info.prefix is None:
             self.notify("Select a folder to download.", severity="warning")
             return
-        default_dir = str(
-            Path.home() / "Downloads" / self._prefix_download_name(info)
-        )
+        default_dir = str(Path.home() / "Downloads" / self._prefix_download_name(info))
         info_lines = self._download_prefix_info_lines(info)
         target = await self.push_screen_wait(
             DownloadDialog(
@@ -1818,9 +1929,7 @@ class S3Browser(App):
         if not objects:
             self.notify("No files to download.", severity="warning")
             return
-        self.notify(
-            f"Downloading {len(objects)} files...", severity="information"
-        )
+        self.notify(f"Downloading {len(objects)} files...", severity="information")
         base_prefix = info.prefix or ""
         if base_prefix and not base_prefix.endswith("/"):
             base_prefix = f"{base_prefix}/"
@@ -2224,8 +2333,8 @@ class S3Browser(App):
                 return
             has_cached = bool(cached)
             if has_cached:
-                self.bucket_profile_candidates = self._collect_bucket_profile_candidates(
-                    cached
+                self.bucket_profile_candidates = (
+                    self._collect_bucket_profile_candidates(cached)
                 )
                 self.path_input.placeholder = "bucket/prefix/ (cached)"
                 self._render_bucket_nodes(cached)
@@ -2294,12 +2403,12 @@ class S3Browser(App):
             )
             cached_resolution: Optional[list[BucketInfo]] = None
             if has_cached:
-                cached_resolution = self._reuse_cached_bucket_resolution(buckets, cached)
+                cached_resolution = self._reuse_cached_bucket_resolution(
+                    buckets, cached
+                )
 
             if cached_resolution is not None:
-                overlay.update_detail(
-                    "Using cached profile and permission mapping..."
-                )
+                overlay.update_detail("Using cached profile and permission mapping...")
                 overlay.update_progress(1, 1, "Permissions")
                 buckets = cached_resolution
             else:
@@ -2479,7 +2588,9 @@ class S3Browser(App):
             self.bucket_nodes.pop(old_bucket_key, None)
             self.bucket_nodes[(new_profile, bucket)] = bucket_node
             try:
-                bucket_node.data = NodeInfo(profile=new_profile, bucket=bucket, prefix="")
+                bucket_node.data = NodeInfo(
+                    profile=new_profile, bucket=bucket, prefix=""
+                )
             except Exception:
                 pass
             try:
@@ -2560,7 +2671,10 @@ class S3Browser(App):
 
     async def _try_bucket_profile_fallback(
         self, info: NodeInfo, node: object
-    ) -> tuple[Optional[tuple[NodeInfo, list[str], list[ObjectInfo], bool]], list[Optional[str]]]:
+    ) -> tuple[
+        Optional[tuple[NodeInfo, list[str], list[ObjectInfo], bool]],
+        list[Optional[str]],
+    ]:
         candidates = self._profile_candidates_for_bucket(info.bucket)
         attempted: list[Optional[str]] = []
         for profile in candidates:
@@ -2621,7 +2735,10 @@ class S3Browser(App):
                 node.data = info
             except Exception:
                 pass
-        resolved_profile, resolved_access = await self._resolve_profile_for_bucket_access(
+        (
+            resolved_profile,
+            resolved_access,
+        ) = await self._resolve_profile_for_bucket_access(
             info.bucket,
             info.profile,
         )
@@ -2858,11 +2975,13 @@ class S3Browser(App):
             return
         row_key = self._row_key_for_cursor()
         if row_key is None:
+            self._reset_preview()
             self._set_preview_header("")
             self._set_preview_text("Select a file or folder to preview.")
             return
         info = self._row_info.get(row_key)
         if not info:
+            self._reset_preview()
             self._set_preview_header("")
             self._set_preview_text("Select a file or folder to preview.")
             return
@@ -2870,6 +2989,7 @@ class S3Browser(App):
             await self._load_prefix_stats(info)
             return
         if info.kind != "object" or not info.key or not info.bucket:
+            self._reset_preview()
             self._set_preview_header("")
             self._set_preview_text("Select a file or folder to preview.")
             return
@@ -2877,6 +2997,7 @@ class S3Browser(App):
 
     async def _load_prefix_stats(self, info: RowInfo) -> None:
         if not info.bucket:
+            self._reset_preview()
             self._set_preview_header("")
             self._set_preview_text("Select a file or folder to preview.")
             return
@@ -2887,6 +3008,8 @@ class S3Browser(App):
         self._preview_next_start = 0
         self._preview_total = None
         self._preview_truncated = False
+        self._preview_mode = PREVIEW_MODE_PLAIN
+        self._preview_language = None
         self._clear_stats_state()
         self._set_preview_button("Scan", visible=True, disabled=True)
         self.preview_status.update("")
@@ -2956,10 +3079,23 @@ class S3Browser(App):
     async def _load_preview(self, info: RowInfo) -> None:
         self._preview_token += 1
         token = self._preview_token
+        self._preview_key = None
+        self._preview_content = ""
+        self._preview_next_start = 0
+        self._preview_total = None
+        self._preview_truncated = False
+        self._preview_mode = PREVIEW_MODE_PLAIN
+        self._preview_language = None
         self._set_preview_header("")
         self._set_preview_text("Loading preview...")
         self._clear_stats_state()
         self._set_preview_button("More", visible=False)
+        mode = _preview_mode_for_name(PurePosixPath(info.key).name)
+        max_bytes = self._preview_bytes
+        if mode == PREVIEW_MODE_GZIP:
+            max_bytes = max(max_bytes, GZIP_PREVIEW_MAX_INPUT_BYTES)
+        elif mode == PREVIEW_MODE_SAMTOOLS:
+            max_bytes = max(max_bytes, SAMTOOLS_PREVIEW_MAX_INPUT_BYTES)
         try:
             data, total, truncated = await self._call_with_sso_retry(
                 info.profile,
@@ -2967,7 +3103,7 @@ class S3Browser(App):
                 info.profile,
                 info.bucket,
                 info.key,
-                max_bytes=self._preview_bytes,
+                max_bytes=max_bytes,
             )
         except Exception as exc:
             if token != self._preview_token:
@@ -2977,14 +3113,42 @@ class S3Browser(App):
             return
         if token != self._preview_token:
             return
+        preview_content = data.decode("utf-8", errors="replace")
+        preview_mode: Literal["plain", "gzip", "samtools"] = PREVIEW_MODE_PLAIN
+        preview_truncated = truncated
+        if mode == PREVIEW_MODE_GZIP:
+            gzip_preview = _decode_gzip_preview(
+                data, max_output_bytes=self._preview_bytes
+            )
+            if gzip_preview is not None:
+                preview_content = gzip_preview
+                preview_mode = PREVIEW_MODE_GZIP
+                preview_truncated = False
+        elif mode == PREVIEW_MODE_SAMTOOLS:
+            samtools_preview = await asyncio.to_thread(
+                self._samtools_head_preview, data
+            )
+            if samtools_preview is not None:
+                preview_content = samtools_preview
+                preview_mode = PREVIEW_MODE_SAMTOOLS
+                preview_truncated = False
         self._preview_key = info
-        self._preview_content = data.decode("utf-8", errors="replace")
+        self._preview_content = preview_content
         self._preview_next_start = len(data)
         self._preview_total = total
-        self._preview_truncated = truncated
+        self._preview_truncated = preview_truncated
+        self._preview_mode = preview_mode
+        if preview_mode != PREVIEW_MODE_SAMTOOLS:
+            self._preview_language = _preview_language_for_name(
+                PurePosixPath(info.key).name
+            )
+        else:
+            self._preview_language = None
         self._render_preview()
 
     async def _load_more_preview(self) -> None:
+        if self._preview_mode != PREVIEW_MODE_PLAIN:
+            return
         if not self._preview_key:
             return
         info = self._preview_key
@@ -3110,7 +3274,9 @@ class S3Browser(App):
     ) -> None:
         name_style = ""
         if info.kind == "bucket":
-            name_style = self._bucket_name_style(self._bucket_access_for_name(info.bucket))
+            name_style = self._bucket_name_style(
+                self._bucket_access_for_name(info.bucket)
+            )
         row_key = self.s3_table.add_row(
             ellipsis_text(row_icon(info)),
             ellipsis_text(name, style=name_style),
@@ -3166,6 +3332,8 @@ class S3Browser(App):
             self._preview_next_start = 0
             self._preview_total = None
             self._preview_truncated = False
+            self._preview_mode = PREVIEW_MODE_PLAIN
+            self._preview_language = None
             self._clear_stats_state()
             self._set_preview_header("")
             self._set_preview_text("")
@@ -3325,6 +3493,8 @@ class S3Browser(App):
             self._preview_next_start = 0
             self._preview_total = None
             self._preview_truncated = False
+            self._preview_mode = PREVIEW_MODE_PLAIN
+            self._preview_language = None
             self._clear_stats_state()
             self._set_preview_header(header)
             self._set_preview_text("")
@@ -3338,6 +3508,8 @@ class S3Browser(App):
             self._preview_next_start = 0
             self._preview_total = None
             self._preview_truncated = False
+            self._preview_mode = PREVIEW_MODE_PLAIN
+            self._preview_language = None
             self._clear_stats_state()
             self._set_preview_header("")
             self._set_preview_text("")
@@ -3600,10 +3772,19 @@ class S3Browser(App):
         return None
 
     def _set_preview_text(self, text: str) -> None:
+        self._apply_preview_language()
         if not text:
             self.preview.load_text("")
             return
         self.preview.load_text(text)
+
+    def _apply_preview_language(self) -> None:
+        target = self._preview_language
+        if target is not None and target not in self.preview.available_languages:
+            target = None
+        if self.preview.language == target:
+            return
+        self.preview.language = target
 
     def _set_preview_header(self, text: str) -> None:
         self.preview_header.update(text)
@@ -3682,6 +3863,8 @@ class S3Browser(App):
         self._preview_next_start = 0
         self._preview_total = None
         self._preview_truncated = False
+        self._preview_mode = PREVIEW_MODE_PLAIN
+        self._preview_language = None
         self._preview_stats_info = info
         self._preview_stats_shallow = shallow
         self._preview_stats_deep = deep
@@ -3765,11 +3948,47 @@ class S3Browser(App):
         self._preview_next_start = 0
         self._preview_total = None
         self._preview_truncated = False
+        self._preview_mode = PREVIEW_MODE_PLAIN
+        self._preview_language = None
         self._clear_stats_state()
         self._set_preview_header("")
         self._set_preview_text("")
         self.preview_status.update("")
         self._set_preview_button("More", visible=False)
+
+    def _samtools_is_available(self) -> bool:
+        if self._samtools_available is None:
+            self._samtools_available = shutil.which("samtools") is not None
+        return self._samtools_available
+
+    def _register_optional_preview_languages(self) -> None:
+        for language_name in ("csv", "tsv"):
+            language = _resolve_tree_sitter_language(language_name)
+            if language is None:
+                continue
+            self.preview.register_language(
+                language_name,
+                language,
+                CSV_TSV_HIGHLIGHT_QUERY,
+            )
+
+    def _samtools_head_preview(self, data: bytes) -> Optional[str]:
+        if not self._samtools_is_available():
+            return None
+        try:
+            completed = subprocess.run(
+                ["samtools", "view", "-h", "-"],
+                input=data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            self._samtools_available = False
+            return None
+        output = completed.stdout.decode("utf-8", errors="replace")
+        if not output:
+            return None
+        return _head_lines(output, SAMTOOLS_HEAD_LINES)
 
     def _remove_pending_nodes(self) -> None:
         for node, kind, key in reversed(self._pending_created):
@@ -4020,7 +4239,9 @@ def _print_root_help_rich() -> None:
     commands.add_row("cp", "Wrapper for aws s3 cp")
     commands.add_row("sync", "Wrapper for aws s3 sync")
     commands.add_row("login", "Run AWS SSO login for profiles that currently need it")
-    commands.add_row("reindex", "Force refresh bucket permission/profile cache (opens TUI)")
+    commands.add_row(
+        "reindex", "Force refresh bucket permission/profile cache (opens TUI)"
+    )
     console.print(commands)
 
     console.print("")
