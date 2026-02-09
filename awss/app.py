@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
+import shlex
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,12 +12,15 @@ from pathlib import Path, PurePosixPath
 from time import monotonic
 from typing import Optional
 
+from rich.console import Console
 from rich.style import Style
 from rich.measure import Measurement
 from rich.segment import Segment
+from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.strip import Strip
@@ -892,6 +898,10 @@ class S3Browser(App):
         min-height: 6;
     }
 
+    #preview.preview-focused {
+        border: round $accent;
+    }
+
     #preview-header {
         height: 3;
         padding: 0 1;
@@ -984,23 +994,29 @@ class S3Browser(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
-        ("escape", "confirm_quit", "Quit x2"),
+        ("escape", "confirm_quit", "Esc x2"),
         ("r", "refresh", "Refresh"),
         ("enter", "open", "Open"),
         ("backspace", "up", "Up"),
-        ("alt+left", "back", "Back"),
-        ("alt+right", "forward", "Forward"),
-        ("ctrl+l", "focus_path", "Path"),
+        Binding("alt+left", "back", "Back", show=False),
+        Binding("alt+right", "forward", "Forward", show=False),
+        Binding("ctrl+l", "focus_path", "Path", key_display="/"),
         ("ctrl+f", "toggle_favorite", "Favorite"),
         ("space", "preview", "Preview"),
         ("m", "preview_more", "More/Scan"),
     ]
 
     def __init__(
-        self, profiles: Optional[list[str]] = None, region: Optional[str] = None
+        self,
+        profiles: Optional[list[str]] = None,
+        region: Optional[str] = None,
+        initial_path: Optional[str] = None,
+        startup_force_refresh: bool = False,
     ) -> None:
         super().__init__()
         self.service = S3Service(profiles=profiles, region=region)
+        self._initial_path = initial_path
+        self._startup_force_refresh = startup_force_refresh
         self.buckets: list[BucketInfo] = []
         self.bucket_nodes: dict[tuple[Optional[str], str], object] = {}
         self.bucket_profile_candidates: dict[str, list[Optional[str]]] = {}
@@ -1127,6 +1143,7 @@ class S3Browser(App):
         self.nav_back = self.query_one("#nav-back", Button)
         self.nav_forward = self.query_one("#nav-forward", Button)
         self.download_button = self.query_one("#download", Button)
+        self.preview_container = self.query_one("#preview", Vertical)
         self.preview_header = self.query_one("#preview-header", Static)
         self.preview = self.query_one("#preview-content", TextArea)
         self.preview_status = self.query_one("#preview-status", Static)
@@ -1160,7 +1177,18 @@ class S3Browser(App):
 
     async def _startup_refresh_flow(self) -> None:
         await self._ensure_sso_logins()
-        await self.refresh_buckets(force=False)
+        await self.refresh_buckets(force=self._startup_force_refresh)
+        if not self._initial_path:
+            return
+        target = self._resolve_input_path(self._initial_path).strip()
+        bucket, prefix = self._parse_s3_path(target)
+        if not bucket:
+            self.notify(
+                f"Invalid startup path: {self._initial_path}", severity="warning"
+            )
+            return
+        profile = self._profile_for_bucket(bucket)
+        self.navigate_to(profile, bucket, prefix)
 
     async def _ensure_sso_logins(self) -> None:
         if not hasattr(self.service, "sso_login_targets"):
@@ -3394,15 +3422,32 @@ class S3Browser(App):
             self._canonical_path, canonical=self._canonical_path, suppress_filter=True
         )
 
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        if not hasattr(self, "preview") or not hasattr(self, "preview_container"):
+            return
+        if event.widget is self.preview:
+            self.preview_container.add_class("preview-focused")
+            return
+        self.preview_container.remove_class("preview-focused")
+
+    def on_descendant_blur(self, event: events.DescendantBlur) -> None:
+        if not hasattr(self, "preview") or not hasattr(self, "preview_container"):
+            return
+        if event.widget is not self.preview:
+            return
+        self.preview_container.remove_class("preview-focused")
+
     def on_key(self, event: events.Key) -> None:
         if event.key != "escape" and self._quit_escape_deadline:
             self._quit_escape_deadline = 0.0
         if self.path_input.has_focus:
+            if event.key == "down":
+                self.set_focus(self.s3_table)
+                event.stop()
             return
         if event.key != "slash" and event.character != "/":
             return
         self.set_focus(self.path_input)
-        self.path_input.insert_text_at_cursor("/")
         event.stop()
 
     def _parse_s3_path(self, value: str) -> tuple[str, str]:
@@ -3755,7 +3800,9 @@ def _parse_profiles(args: argparse.Namespace) -> Optional[list[str]]:
     return profiles or None
 
 
-def _add_browse_args(parser: argparse.ArgumentParser) -> None:
+def _add_profile_selection_args(
+    parser: argparse.ArgumentParser, include_region: bool = True
+) -> None:
     parser.add_argument(
         "--profiles",
         help="Comma-separated AWS profiles to load (defaults to all available)",
@@ -3766,25 +3813,188 @@ def _add_browse_args(parser: argparse.ArgumentParser) -> None:
         action="append",
         help="AWS profile to add (can be used multiple times)",
     )
+    if include_region:
+        parser.add_argument(
+            "--region",
+            help="AWS region override for S3 client",
+        )
+
+
+def _add_browse_args(parser: argparse.ArgumentParser) -> None:
+    _add_profile_selection_args(parser, include_region=True)
     parser.add_argument(
-        "--region",
-        help="AWS region override for S3 client",
+        "path",
+        nargs="?",
+        help="Optional startup path like s3://bucket/prefix or bucket/prefix",
     )
+
+
+def _normalize_s3_uri(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return "s3://"
+    if raw.startswith("s3://"):
+        return raw
+    return f"s3://{raw.lstrip('/')}"
+
+
+def _is_local_path(value: str) -> bool:
+    if value in {".", "..", "-"}:
+        return True
+    if value.startswith(("./", "../", "/", "~")):
+        return True
+    return bool(re.match(r"^[A-Za-z]:[\\\\/]", value))
+
+
+def _normalize_transfer_path(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return raw
+    if raw.startswith("s3://"):
+        return raw
+    if "://" in raw:
+        return raw
+    if _is_local_path(raw):
+        return raw
+    return _normalize_s3_uri(raw)
+
+
+def _run_aws_s3_command(
+    operation: str,
+    paths: list[str],
+    extra_args: list[str],
+    dry_run: bool = False,
+) -> int:
+    command = ["aws", "s3", operation, *paths]
+    passthrough = list(extra_args)
+
+    if operation == "ls" and "--human-readable" not in passthrough:
+        command.append("--human-readable")
+
+    if operation in {"cp", "sync"} and dry_run and "--dryrun" not in passthrough:
+        command.append("--dryrun")
+
+    command.extend(passthrough)
+
+    if operation == "ls" and dry_run:
+        rendered = " ".join(shlex.quote(part) for part in command)
+        print(f"DRY RUN: {rendered}")
+        return 0
+
+    try:
+        completed = subprocess.run(command)
+    except FileNotFoundError:
+        print("AWS CLI not found in PATH.", file=sys.stderr)
+        return 127
+    return int(completed.returncode)
+
+
+def _run_sso_login(profile: str) -> int:
+    try:
+        completed = subprocess.run(["aws", "sso", "login", "--profile", profile])
+    except FileNotFoundError:
+        print("AWS CLI not found in PATH.", file=sys.stderr)
+        return 127
+    return int(completed.returncode)
+
+
+def _run_login_command(profiles: Optional[list[str]]) -> int:
+    service = S3Service(profiles=profiles)
+    try:
+        targets = service.sso_login_targets()
+    except Exception as exc:
+        print(f"Unable to determine SSO login targets: {exc}", file=sys.stderr)
+        return 1
+
+    if not targets:
+        print("No SSO logins required.")
+        return 0
+
+    failures = 0
+    for profile in targets:
+        print(f"Running aws sso login --profile {profile} ...", file=sys.stderr)
+        code = _run_sso_login(profile)
+        if code != 0:
+            failures += 1
+    return 0 if failures == 0 else 1
+
+
+def _run_browser_command(
+    profiles: Optional[list[str]],
+    region: Optional[str],
+    initial_path: Optional[str],
+    startup_force_refresh: bool,
+) -> int:
+    app = S3Browser(
+        profiles=profiles,
+        region=region,
+        initial_path=initial_path,
+        startup_force_refresh=startup_force_refresh,
+    )
+    app.run()
+    return 0
+
+
+def _print_root_help_rich() -> None:
+    console = Console()
+    console.print("[bold]s3[/bold] - S3 browser and AWS SSO profile utilities")
+    console.print(
+        "Tip: run [bold]s3[/bold] with no arguments to launch the interactive TUI browser."
+    )
+    console.print("")
+
+    commands = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    commands.add_column("Command", style="cyan", no_wrap=True)
+    commands.add_column("Description", style="white")
+    commands.add_row("generate-config", "Generate/merge AWS CLI SSO profiles")
+    commands.add_row("ls", "Wrapper for aws s3 ls (human-readable by default)")
+    commands.add_row("cp", "Wrapper for aws s3 cp")
+    commands.add_row("sync", "Wrapper for aws s3 sync")
+    commands.add_row("login", "Run AWS SSO login for profiles that currently need it")
+    commands.add_row("reindex", "Force refresh bucket permission/profile cache (opens TUI)")
+    console.print(commands)
+
+    console.print("")
+    console.print("[bold]Examples[/bold]")
+    console.print("  s3")
+    console.print("  s3 s3://my-bucket/path/")
+    console.print("  s3 my-bucket/path --profiles dev")
+    console.print("  s3 ls my-bucket/path --recursive")
+    console.print("  s3 cp my-bucket/file.txt . --dry-run")
+    console.print("  s3 sync my-bucket/prefix ./local-dir --dry-run")
+    console.print("  s3 login")
+    console.print("  s3 reindex")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
+    help_examples = (
+        "Examples:\n"
+        "  s3\n"
+        "  s3 s3://my-bucket/path/\n"
+        "  s3 my-bucket/path --profiles dev\n"
+        "  s3 ls my-bucket/path --recursive\n"
+        "  s3 cp my-bucket/file.txt . --dry-run\n"
+        "  s3 sync my-bucket/prefix ./local-dir --dry-run\n"
+        "  s3 login\n"
+        "  s3 reindex"
+    )
     parser = argparse.ArgumentParser(
         prog="s3",
-        description="S3 browser and AWS SSO profile utilities",
+        description=(
+            "S3 browser and AWS SSO profile utilities "
+            "(run `s3` with no arguments to launch the TUI browser)."
+        ),
+        epilog=help_examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command")
+    browse_mode_parser = argparse.ArgumentParser(
+        prog="s3",
+        description="Launch the interactive S3 browser",
+    )
+    _add_browse_args(browse_mode_parser)
 
-    browse_parser = subparsers.add_parser(
-        "browse",
-        help="Launch the interactive S3 browser",
-    )
-    _add_browse_args(browse_parser)
+    subparsers = parser.add_subparsers(dest="command")
 
     generate_parser = subparsers.add_parser(
         "generate-config",
@@ -3795,25 +4005,153 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help="Only generate profiles for this SSO session name",
     )
+    ls_parser = subparsers.add_parser(
+        "ls",
+        help="Wrapper for aws s3 ls with human-readable output by default",
+    )
+    ls_parser.add_argument(
+        "path",
+        nargs="?",
+        help="S3 path, e.g. s3://bucket/prefix or bucket/prefix",
+    )
+    ls_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the resolved command without executing it",
+    )
 
-    commands = {"browse", "generate-config"}
+    cp_parser = subparsers.add_parser(
+        "cp",
+        help="Wrapper for aws s3 cp",
+    )
+    cp_parser.add_argument("source")
+    cp_parser.add_argument("destination")
+    cp_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run copy in dry-run mode",
+    )
+
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="Wrapper for aws s3 sync",
+    )
+    sync_parser.add_argument("source")
+    sync_parser.add_argument("destination")
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run sync in dry-run mode",
+    )
+
+    login_parser = subparsers.add_parser(
+        "login",
+        help="Run AWS SSO login for profiles that currently need it",
+    )
+    _add_profile_selection_args(login_parser, include_region=False)
+
+    reindex_parser = subparsers.add_parser(
+        "reindex",
+        help="Force refresh bucket permission/profile cache (opens TUI)",
+    )
+    _add_browse_args(reindex_parser)
+
+    commands = {
+        "generate-config",
+        "ls",
+        "cp",
+        "sync",
+        "login",
+        "reindex",
+    }
+    if args_list and args_list[0] == "browse":
+        args_list = args_list[1:]
+
     if not args_list:
-        args_list = ["browse"]
-    elif args_list[0] not in commands and args_list[0] not in {"-h", "--help"}:
-        args_list = ["browse", *args_list]
+        browse_args, browse_unknown = browse_mode_parser.parse_known_args([])
+        if browse_unknown:
+            browse_mode_parser.error(
+                f"unrecognized arguments: {' '.join(browse_unknown)}"
+            )
+        profiles = _parse_profiles(browse_args)
+        return _run_browser_command(
+            profiles,
+            browse_args.region,
+            initial_path=_normalize_s3_uri(browse_args.path)
+            if browse_args.path
+            else None,
+            startup_force_refresh=False,
+        )
 
-    args = parser.parse_args(args_list)
+    if args_list[0] in {"-h", "--help"}:
+        _print_root_help_rich()
+        return 0
+
+    if args_list[0] not in commands:
+        browse_args, browse_unknown = browse_mode_parser.parse_known_args(args_list)
+        if browse_unknown:
+            browse_mode_parser.error(
+                f"unrecognized arguments: {' '.join(browse_unknown)}"
+            )
+        profiles = _parse_profiles(browse_args)
+        return _run_browser_command(
+            profiles,
+            browse_args.region,
+            initial_path=_normalize_s3_uri(browse_args.path)
+            if browse_args.path
+            else None,
+            startup_force_refresh=False,
+        )
+
+    args, unknown = parser.parse_known_args(args_list)
 
     if args.command == "generate-config":
         generate_args: list[str] = []
         if args.sso_session:
             generate_args.extend(["--sso-session", args.sso_session])
+        generate_args.extend(unknown)
         return int(generate_config_main(generate_args))
 
-    profiles = _parse_profiles(args)
-    app = S3Browser(profiles=profiles, region=args.region)
-    app.run()
-    return 0
+    if args.command == "reindex":
+        if unknown:
+            parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+        profiles = _parse_profiles(args)
+        initial_path = _normalize_s3_uri(args.path) if args.path else None
+        return _run_browser_command(
+            profiles,
+            args.region,
+            initial_path=initial_path,
+            startup_force_refresh=True,
+        )
+
+    if args.command == "login":
+        if unknown:
+            parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+        profiles = _parse_profiles(args)
+        return _run_login_command(profiles)
+
+    if args.command == "ls":
+        paths: list[str] = []
+        if args.path:
+            paths.append(_normalize_s3_uri(args.path))
+        return _run_aws_s3_command("ls", paths, unknown, dry_run=args.dry_run)
+
+    if args.command == "cp":
+        paths = [
+            _normalize_transfer_path(args.source),
+            _normalize_transfer_path(args.destination),
+        ]
+        return _run_aws_s3_command("cp", paths, unknown, dry_run=args.dry_run)
+
+    if args.command == "sync":
+        paths = [
+            _normalize_transfer_path(args.source),
+            _normalize_transfer_path(args.destination),
+        ]
+        return _run_aws_s3_command("sync", paths, unknown, dry_run=args.dry_run)
+
+    parser.error("Unknown command")
+    return 2
 
 
 if __name__ == "__main__":
