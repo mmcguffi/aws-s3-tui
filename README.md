@@ -7,6 +7,9 @@ It provides:
 - Lightweight wrappers for `aws s3 ls`, `aws s3 cp`, and `aws s3 sync`
 - Automatic "best profile" detection for managing multiple roles to reduce profile/session friction
 
+![Example](https://raw.githubusercontent.com/mmcguffi/awss/main/docs/images/example.png)
+
+
 ## Install
 
 From PyPI:
