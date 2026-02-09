@@ -17,6 +17,7 @@ BUCKET_ACCESS_UNKNOWN = "unknown"
 BUCKET_ACCESS_NO_VIEW = "no_view"
 BUCKET_ACCESS_NO_DOWNLOAD = "no_download"
 BUCKET_ACCESS_GOOD = "good"
+DEFAULT_BUCKET_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 BUCKET_ACCESS_LEVELS = {
     BUCKET_ACCESS_NO_VIEW: 0,
     BUCKET_ACCESS_NO_DOWNLOAD: 1,
@@ -47,7 +48,7 @@ class S3Service:
         profiles: Optional[list[str]] = None,
         region: Optional[str] = None,
         cache_path: Optional[Path] = None,
-        cache_ttl_seconds: int = 3600,
+        cache_ttl_seconds: int = DEFAULT_BUCKET_CACHE_TTL_SECONDS,
     ) -> None:
         self.profiles = self._normalize_profiles(profiles)
         self._region = region

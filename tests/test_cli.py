@@ -130,9 +130,11 @@ class TestCliDispatch(unittest.TestCase):
 
 class TestAwsWrapper(unittest.TestCase):
     def test_ls_adds_human_readable(self) -> None:
-        with patch("awss.app.subprocess.run") as run_mock:
-            run_mock.return_value.returncode = 0
-            code = _run_aws_s3_command("ls", ["s3://bucket-a"], [])
+        with patch("awss.app.S3Service") as service_cls:
+            service_cls.return_value.load_cached_bucket_preferences.return_value = {}
+            with patch("awss.app.subprocess.run") as run_mock:
+                run_mock.return_value.returncode = 0
+                code = _run_aws_s3_command("ls", ["s3://bucket-a"], [])
 
         run_mock.assert_called_once_with(
             ["aws", "s3", "ls", "s3://bucket-a", "--human-readable"]
@@ -140,26 +142,80 @@ class TestAwsWrapper(unittest.TestCase):
         self.assertEqual(code, 0)
 
     def test_ls_dry_run_prints_command(self) -> None:
-        with patch("awss.app.subprocess.run") as run_mock:
-            with patch("builtins.print") as print_mock:
-                code = _run_aws_s3_command("ls", ["s3://bucket-a"], [], dry_run=True)
+        with patch("awss.app.S3Service") as service_cls:
+            service_cls.return_value.load_cached_bucket_preferences.return_value = {}
+            with patch("awss.app.subprocess.run") as run_mock:
+                with patch("builtins.print") as print_mock:
+                    code = _run_aws_s3_command(
+                        "ls", ["s3://bucket-a"], [], dry_run=True
+                    )
 
         run_mock.assert_not_called()
         print_mock.assert_called()
         self.assertEqual(code, 0)
 
     def test_cp_adds_dryrun(self) -> None:
-        with patch("awss.app.subprocess.run") as run_mock:
-            run_mock.return_value.returncode = 0
-            code = _run_aws_s3_command(
-                "cp",
-                ["s3://bucket-a/key.txt", "."],
-                [],
-                dry_run=True,
-            )
+        with patch("awss.app.S3Service") as service_cls:
+            service_cls.return_value.load_cached_bucket_preferences.return_value = {}
+            with patch("awss.app.subprocess.run") as run_mock:
+                run_mock.return_value.returncode = 0
+                code = _run_aws_s3_command(
+                    "cp",
+                    ["s3://bucket-a/key.txt", "."],
+                    [],
+                    dry_run=True,
+                )
 
         run_mock.assert_called_once_with(
             ["aws", "s3", "cp", "s3://bucket-a/key.txt", ".", "--dryrun"]
+        )
+        self.assertEqual(code, 0)
+
+    def test_ls_uses_cached_bucket_profile(self) -> None:
+        with patch("awss.app.S3Service") as service_cls:
+            service_cls.return_value.load_cached_bucket_preferences.return_value = {
+                "bucket-a": "dev"
+            }
+            with patch("awss.app.subprocess.run") as run_mock:
+                run_mock.return_value.returncode = 0
+                code = _run_aws_s3_command("ls", ["s3://bucket-a/path"], [])
+
+        run_mock.assert_called_once_with(
+            [
+                "aws",
+                "s3",
+                "ls",
+                "s3://bucket-a/path",
+                "--human-readable",
+                "--profile",
+                "dev",
+            ]
+        )
+        self.assertEqual(code, 0)
+
+    def test_explicit_profile_overrides_cached_profile(self) -> None:
+        with patch("awss.app.S3Service") as service_cls:
+            service_cls.return_value.load_cached_bucket_preferences.return_value = {
+                "bucket-a": "dev"
+            }
+            with patch("awss.app.subprocess.run") as run_mock:
+                run_mock.return_value.returncode = 0
+                code = _run_aws_s3_command(
+                    "ls",
+                    ["s3://bucket-a/path"],
+                    ["--profile", "prod"],
+                )
+
+        run_mock.assert_called_once_with(
+            [
+                "aws",
+                "s3",
+                "ls",
+                "s3://bucket-a/path",
+                "--human-readable",
+                "--profile",
+                "prod",
+            ]
         )
         self.assertEqual(code, 0)
 
