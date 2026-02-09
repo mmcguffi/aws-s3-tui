@@ -3859,6 +3859,71 @@ def _normalize_transfer_path(value: str) -> str:
     return _normalize_s3_uri(raw)
 
 
+def _has_profile_flag(args: list[str]) -> bool:
+    for arg in args:
+        if arg == "--profile" or arg.startswith("--profile="):
+            return True
+    return False
+
+
+def _bucket_from_s3_path(path: str) -> Optional[str]:
+    if not path.startswith("s3://"):
+        return None
+    remainder = path[5:]
+    if not remainder:
+        return None
+    bucket = remainder.split("/", 1)[0].strip()
+    return bucket or None
+
+
+def _profile_from_cached_bucket_preferences(
+    paths: list[str], extra_args: list[str]
+) -> Optional[str]:
+    if _has_profile_flag(extra_args):
+        return None
+
+    buckets: list[str] = []
+    seen_buckets: set[str] = set()
+    for path in paths:
+        bucket = _bucket_from_s3_path(path)
+        if not bucket or bucket in seen_buckets:
+            continue
+        seen_buckets.add(bucket)
+        buckets.append(bucket)
+    if not buckets:
+        return None
+
+    try:
+        cached_profiles = S3Service().load_cached_bucket_preferences()
+    except Exception:
+        return None
+    if not cached_profiles:
+        return None
+
+    bucket_profiles: list[tuple[str, Optional[str]]] = []
+    for bucket in buckets:
+        if bucket in cached_profiles:
+            bucket_profiles.append((bucket, cached_profiles[bucket]))
+    if not bucket_profiles:
+        return None
+
+    non_default_profiles: list[str] = []
+    seen_profiles: set[str] = set()
+    for _, profile in bucket_profiles:
+        if profile is None or profile in seen_profiles:
+            continue
+        seen_profiles.add(profile)
+        non_default_profiles.append(profile)
+
+    if len(non_default_profiles) == 1:
+        return non_default_profiles[0]
+    if len(non_default_profiles) > 1:
+        for _, profile in bucket_profiles:
+            if profile is not None:
+                return profile
+    return None
+
+
 def _run_aws_s3_command(
     operation: str,
     paths: list[str],
@@ -3873,6 +3938,10 @@ def _run_aws_s3_command(
 
     if operation in {"cp", "sync"} and dry_run and "--dryrun" not in passthrough:
         command.append("--dryrun")
+
+    profile = _profile_from_cached_bucket_preferences(paths, passthrough)
+    if profile:
+        command.extend(["--profile", profile])
 
     command.extend(passthrough)
 
